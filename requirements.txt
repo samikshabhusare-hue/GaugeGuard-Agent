@@ -1,0 +1,5 @@
+# Direct dependencies pinned for the initial Python scaffold.
+# Generate a full transitive lock after confirming the team deployment environment.
+opencv-python-headless==5.0.0.93
+numpy==2.5.4
+streamlit==1.66.0
