@@ -196,6 +196,40 @@ def get_profile(name: str) -> GaugeProfile:
     return PROFILES[name]
 
 
+# === Calibration Result ===
+
+
+@dataclass(frozen=True)
+class CalibrationResult:
+    """Result from converting a needle angle to a gauge reading.
+
+    Assumption: Linear scale mapping between angle and value.
+    """
+    value: float | None  # None if angle invalid or out of bounds
+    unit: str
+    in_bounds: bool  # angle within profile's min/max sweep
+    at_scale_limit: bool  # near endpoints (within bounds_margin_deg)
+    within_operating_limits: bool  # in safe range if defined
+    value_low: float | None  # lower bound if uncertainty provided (future)
+    value_high: float | None  # upper bound if uncertainty provided (future)
+    flags: tuple[str, ...]  # e.g., "invalid_angle", "angle_outside_scale", "at_scale_min"
+    reason: str  # human-readable explanation
+
+    def to_dict(self) -> dict:
+        """Return JSON-serializable dict (only built-in types)."""
+        return {
+            "value": self.value,
+            "unit": self.unit,
+            "in_bounds": self.in_bounds,
+            "at_scale_limit": self.at_scale_limit,
+            "within_operating_limits": self.within_operating_limits,
+            "value_low": self.value_low,
+            "value_high": self.value_high,
+            "flags": list(self.flags),
+            "reason": self.reason,
+        }
+
+
 # === Angle Utilities ===
 
 
@@ -232,34 +266,176 @@ def normalize_angle_deg(angle: float) -> float:
     return float(angle % 360.0)
 
 
-# === Legacy angle_to_value (to be extended in future tasks) ===
+# === Angle to Value Conversion ===
 
 
-def angle_to_value(angle_degrees: float, profile: GaugeProfile) -> float:
-    """Map an angle to a linear gauge scale.
+def angle_to_value(
+    angle_deg: float | None,
+    profile: GaugeProfile,
+    angle_uncertainty_deg: float | None = None
+) -> CalibrationResult:
+    """Convert needle angle to gauge reading with bounds checking.
 
-    Angle convention: degrees increase clockwise from the image's positive x axis
-    (rightward). The configured sweep from minimum to maximum must be less than
-    360 degrees. Raises ValueError when the angle lies outside that sweep.
+    Angle convention: 0° = 12 o'clock, clockwise positive.
+    Scale starts at profile.minimum_angle_degrees (minimum_value) and sweeps
+    clockwise to profile.maximum_angle_degrees (maximum_value).
 
-    NOTE: This is the legacy function. It will be replaced by a version returning
-    CalibrationResult in a future task.
+    Assumption: Linear scale mapping (flag "linear_scale_assumed" added to all results).
+
+    Args:
+        angle_deg: Measured needle angle in degrees. None/NaN/inf treated as invalid.
+        profile: Gauge calibration profile.
+        angle_uncertainty_deg: Optional ±uncertainty in degrees (reserved for future use).
+
+    Returns:
+        CalibrationResult with value, bounds flags, and reason.
+
+        Angle handling:
+        - Within scale sweep [0, sweep]: Linear interpolation, in_bounds=True
+        - Within margin past max (sweep, sweep+margin]: Clamped to max_value,
+          at_scale_limit=True, flag "at_scale_max"
+        - Within margin before min [360-margin, 360): Clamped to min_value,
+          at_scale_limit=True, flag "at_scale_min"
+        - Dead zone (outside scale and margins): value=None, in_bounds=False,
+          flag "angle_outside_scale"
+        - Invalid angle (None/NaN/inf/non-number): value=None, in_bounds=False,
+          flag "invalid_angle"
+
+    Raises:
+        CalibrationError: Invalid profile configuration (programmer error).
+
+    Notes:
+        - Never returns a reading for an angle outside the scale and margins.
+        - Bad measured data returns flagged result, never raises exception.
+        - Operating limits and uncertainty ranges not yet implemented.
     """
-    values = (
-        profile.minimum_value,
-        profile.maximum_value,
-        profile.minimum_angle_degrees,
-        profile.maximum_angle_degrees,
-        angle_degrees,
-    )
-    if not all(map(_is_finite, values)):
-        raise ValueError("Gauge calibration values must be finite numbers.")
-    if profile.maximum_value <= profile.minimum_value:
-        raise ValueError("Maximum gauge value must exceed minimum gauge value.")
+    # Validate profile (programmer error if invalid)
+    validate_profile(profile)
 
+    # Base flags always include linear scale assumption
+    flags_list = ["linear_scale_assumed"]
+
+    # Handle invalid angle input (None, NaN, inf, non-number)
+    if angle_deg is None:
+        return CalibrationResult(
+            value=None,
+            unit=profile.unit,
+            in_bounds=False,
+            at_scale_limit=False,
+            within_operating_limits=False,
+            value_low=None,
+            value_high=None,
+            flags=tuple(flags_list + ["invalid_angle"]),
+            reason="Angle is None; cannot compute reading.",
+        )
+
+    if not isinstance(angle_deg, (int, float)):
+        return CalibrationResult(
+            value=None,
+            unit=profile.unit,
+            in_bounds=False,
+            at_scale_limit=False,
+            within_operating_limits=False,
+            value_low=None,
+            value_high=None,
+            flags=tuple(flags_list + ["invalid_angle"]),
+            reason=f"Angle must be a number, got {type(angle_deg).__name__}.",
+        )
+
+    if not _is_finite(angle_deg):
+        return CalibrationResult(
+            value=None,
+            unit=profile.unit,
+            in_bounds=False,
+            at_scale_limit=False,
+            within_operating_limits=False,
+            value_low=None,
+            value_high=None,
+            flags=tuple(flags_list + ["invalid_angle"]),
+            reason=f"Angle must be finite (not NaN or infinity), got {angle_deg}.",
+        )
+
+    # Normalize angle to [0, 360)
+    angle_norm = normalize_angle_deg(angle_deg)
+
+    # Compute sweep and offset
     sweep = (profile.maximum_angle_degrees - profile.minimum_angle_degrees) % 360.0
-    offset = (angle_degrees - profile.minimum_angle_degrees) % 360.0
-    if sweep == 0 or offset > sweep:
-        raise ValueError("Needle angle lies outside the configured gauge scale.")
-    fraction = offset / sweep
-    return profile.minimum_value + fraction * (profile.maximum_value - profile.minimum_value)
+    offset = (angle_norm - profile.minimum_angle_degrees) % 360.0
+    margin = profile.bounds_margin_deg
+
+    # Case 1: Within scale sweep [0, sweep]
+    if offset <= sweep:
+        fraction = offset / sweep
+        value = profile.minimum_value + fraction * (profile.maximum_value - profile.minimum_value)
+
+        # Check if at scale limits (within margin of endpoints)
+        at_limit = False
+        if offset <= margin:
+            at_limit = True
+            flags_list.append("at_scale_min")
+        elif offset >= sweep - margin:
+            at_limit = True
+            flags_list.append("at_scale_max")
+
+        return CalibrationResult(
+            value=value,
+            unit=profile.unit,
+            in_bounds=True,
+            at_scale_limit=at_limit,
+            within_operating_limits=False,  # TODO: implement in next prompt
+            value_low=None,  # TODO: implement uncertainty
+            value_high=None,  # TODO: implement uncertainty
+            flags=tuple(flags_list),
+            reason=f"Angle {angle_norm:.1f}° mapped to value {value:.2f} {profile.unit}.",
+        )
+
+    # Case 2: Within margin past maximum (sweep, sweep + margin]
+    if sweep < offset <= sweep + margin:
+        return CalibrationResult(
+            value=profile.maximum_value,
+            unit=profile.unit,
+            in_bounds=True,
+            at_scale_limit=True,
+            within_operating_limits=False,  # TODO: implement in next prompt
+            value_low=None,
+            value_high=None,
+            flags=tuple(flags_list + ["at_scale_max"]),
+            reason=(
+                f"Angle {angle_norm:.1f}° is {offset - sweep:.1f}° past maximum scale angle; "
+                f"clamped to maximum value {profile.maximum_value:.2f} {profile.unit}."
+            ),
+        )
+
+    # Case 3: Within margin before minimum [360 - margin, 360)
+    if offset >= 360.0 - margin:
+        return CalibrationResult(
+            value=profile.minimum_value,
+            unit=profile.unit,
+            in_bounds=True,
+            at_scale_limit=True,
+            within_operating_limits=False,  # TODO: implement in next prompt
+            value_low=None,
+            value_high=None,
+            flags=tuple(flags_list + ["at_scale_min"]),
+            reason=(
+                f"Angle {angle_norm:.1f}° is {360.0 - offset:.1f}° before minimum scale angle; "
+                f"clamped to minimum value {profile.minimum_value:.2f} {profile.unit}."
+            ),
+        )
+
+    # Case 4: Dead zone (outside scale and margins)
+    return CalibrationResult(
+        value=None,
+        unit=profile.unit,
+        in_bounds=False,
+        at_scale_limit=False,
+        within_operating_limits=False,
+        value_low=None,
+        value_high=None,
+        flags=tuple(flags_list + ["angle_outside_scale"]),
+        reason=(
+            f"Angle {angle_norm:.1f}° is outside the gauge scale "
+            f"[{profile.minimum_angle_degrees:.1f}° to {profile.maximum_angle_degrees:.1f}° "
+            f"with {margin:.1f}° margin]. Dead zone; no reading available."
+        ),
+    )
