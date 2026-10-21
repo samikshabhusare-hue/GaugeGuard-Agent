@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 import pytest
 
 from gaugeguard.calibration import (
+    AgreementResult,
     CalibrationError,
     CalibrationResult,
     GaugeProfile,
@@ -14,6 +16,7 @@ from gaugeguard.calibration import (
     angle_to_value,
     get_profile,
     normalize_angle_deg,
+    readings_agree,
     validate_profile,
 )
 
@@ -804,3 +807,447 @@ def test_angle_to_value_always_has_linear_scale_flag():
     # Dead zone
     result = angle_to_value(180.0, profile)
     assert "linear_scale_assumed" in result.flags
+
+
+# === Operating limits tests ===
+
+
+def test_angle_to_value_within_operating_limits():
+    """Value within operating limits should set within_operating_limits=True."""
+    profile = get_profile("EXAMPLE_270")  # operating_min=10, operating_max=90
+    result = angle_to_value(0.0, profile)  # maps to value 50
+
+    # Expected: value = 50, which is in [10, 90]
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.within_operating_limits is True
+    assert "outside_operating_limits" not in result.flags
+
+
+def test_angle_to_value_below_operating_min():
+    """Value below operating_min should set within_operating_limits=False and flag."""
+    profile = get_profile("EXAMPLE_270")  # operating_min=10, operating_max=90
+    result = angle_to_value(225.0, profile)  # maps to value 0
+
+    # Expected: value = 0, which is < 10
+    assert result.value == 0.0
+    assert result.within_operating_limits is False
+    assert "outside_operating_limits" in result.flags
+
+
+def test_angle_to_value_above_operating_max():
+    """Value above operating_max should set within_operating_limits=False and flag."""
+    profile = get_profile("EXAMPLE_270")  # operating_min=10, operating_max=90
+    result = angle_to_value(135.0, profile)  # maps to value 100
+
+    # Expected: value = 100, which is > 90
+    assert result.value == 100.0
+    assert result.within_operating_limits is False
+    assert "outside_operating_limits" in result.flags
+
+
+def test_angle_to_value_at_operating_boundary():
+    """Value exactly at operating_min or operating_max should be within limits."""
+    profile = GaugeProfile(
+        name="test_boundary",
+        unit="units",
+        minimum_value=0.0,
+        maximum_value=100.0,
+        minimum_angle_degrees=0.0,
+        maximum_angle_degrees=180.0,
+        operating_min=25.0,
+        operating_max=75.0,
+    )
+
+    # Value = 25 (exactly at operating_min)
+    # offset = (45 - 0) % 360 = 45; fraction = 45 / 180 = 0.25; value = 25
+    result = angle_to_value(45.0, profile)
+    assert result.value == pytest.approx(25.0, abs=0.001)
+    assert result.within_operating_limits is True
+
+    # Value = 75 (exactly at operating_max)
+    # offset = (135 - 0) % 360 = 135; fraction = 135 / 180 = 0.75; value = 75
+    result = angle_to_value(135.0, profile)
+    assert result.value == pytest.approx(75.0, abs=0.001)
+    assert result.within_operating_limits is True
+
+
+def test_angle_to_value_no_operating_limits():
+    """Profile without operating limits should set within_operating_limits=False."""
+    profile = GaugeProfile(
+        name="no_limits",
+        unit="bar",
+        minimum_value=0.0,
+        maximum_value=50.0,
+        minimum_angle_degrees=0.0,
+        maximum_angle_degrees=180.0,
+        operating_min=None,
+        operating_max=None,
+    )
+
+    result = angle_to_value(90.0, profile)
+    # Expected: value = 25 (mid-scale), but no operating limits defined
+    assert result.value == pytest.approx(25.0, abs=0.001)
+    assert result.within_operating_limits is False
+    assert "outside_operating_limits" not in result.flags
+
+
+# === Uncertainty range tests ===
+
+
+def test_angle_to_value_with_uncertainty():
+    """Valid angle_uncertainty_deg should compute value_low and value_high."""
+    profile = get_profile("EXAMPLE_270")
+    # sweep = 270°, value range = 100
+    # Angle 0° -> value 50
+    # uncertainty = 10°
+    # value_delta = (10 / 270) * 100 = 3.704
+    # value_low = 50 - 3.704 = 46.296
+    # value_high = 50 + 3.704 = 53.704
+
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=10.0)
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low == pytest.approx(46.296, abs=0.001)
+    assert result.value_high == pytest.approx(53.704, abs=0.001)
+    assert "range_clipped" not in result.flags
+
+
+def test_angle_to_value_uncertainty_clipped_at_min():
+    """Uncertainty range extending below minimum_value should be clipped."""
+    profile = get_profile("EXAMPLE_270")
+    # Angle 225° -> value 0
+    # uncertainty = 20°
+    # value_delta = (20 / 270) * 100 = 7.407
+    # value_low = 0 - 7.407 = -7.407 -> clipped to 0
+    # value_high = 0 + 7.407 = 7.407
+
+    result = angle_to_value(225.0, profile, angle_uncertainty_deg=20.0)
+
+    assert result.value == 0.0
+    assert result.value_low == 0.0  # clipped
+    assert result.value_high == pytest.approx(7.407, abs=0.001)
+    assert "range_clipped" in result.flags
+
+
+def test_angle_to_value_uncertainty_clipped_at_max():
+    """Uncertainty range extending above maximum_value should be clipped."""
+    profile = get_profile("EXAMPLE_270")
+    # Angle 135° -> value 100
+    # uncertainty = 20°
+    # value_delta = (20 / 270) * 100 = 7.407
+    # value_low = 100 - 7.407 = 92.593
+    # value_high = 100 + 7.407 = 107.407 -> clipped to 100
+
+    result = angle_to_value(135.0, profile, angle_uncertainty_deg=20.0)
+
+    assert result.value == 100.0
+    assert result.value_low == pytest.approx(92.593, abs=0.001)
+    assert result.value_high == 100.0  # clipped
+    assert "range_clipped" in result.flags
+
+
+def test_angle_to_value_uncertainty_clipped_both_ends():
+    """Large uncertainty should clip at both ends."""
+    profile = GaugeProfile(
+        name="narrow_range",
+        unit="units",
+        minimum_value=40.0,
+        maximum_value=60.0,
+        minimum_angle_degrees=0.0,
+        maximum_angle_degrees=90.0,
+    )
+
+    # Angle 45° -> value 50 (mid-scale)
+    # sweep = 90°, value range = 20
+    # uncertainty = 100° (very large)
+    # value_delta = (100 / 90) * 20 = 22.222
+    # value_low = 50 - 22.222 = 27.778 -> clipped to 40
+    # value_high = 50 + 22.222 = 72.222 -> clipped to 60
+
+    result = angle_to_value(45.0, profile, angle_uncertainty_deg=100.0)
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low == 40.0  # clipped
+    assert result.value_high == 60.0  # clipped
+    assert "range_clipped" in result.flags
+
+
+def test_angle_to_value_zero_uncertainty():
+    """Zero uncertainty should produce value_low = value_high = value."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=0.0)
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low == pytest.approx(50.0, abs=0.001)
+    assert result.value_high == pytest.approx(50.0, abs=0.001)
+    assert "range_clipped" not in result.flags
+
+
+def test_angle_to_value_negative_uncertainty():
+    """Negative uncertainty should be flagged as invalid and ignored."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=-5.0)
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low is None
+    assert result.value_high is None
+    assert "invalid_uncertainty" in result.flags
+
+
+def test_angle_to_value_nan_uncertainty():
+    """NaN uncertainty should be flagged as invalid and ignored."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=float("nan"))
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low is None
+    assert result.value_high is None
+    assert "invalid_uncertainty" in result.flags
+
+
+def test_angle_to_value_inf_uncertainty():
+    """Infinity uncertainty should be flagged as invalid and ignored."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=float("inf"))
+
+    assert result.value == pytest.approx(50.0, abs=0.001)
+    assert result.value_low is None
+    assert result.value_high is None
+    assert "invalid_uncertainty" in result.flags
+
+
+# === readings_agree tests ===
+
+
+def test_readings_agree_within_tolerance():
+    """Readings within tolerance should agree."""
+    profile = get_profile("EXAMPLE_270")
+    # value range = 100, agreement_tolerance_fraction = 0.02
+    # tolerance = 0.02 * 100 = 2.0
+
+    result = readings_agree(50.0, 51.5, profile)
+
+    # difference = |50 - 51.5| = 1.5, which is <= 2.0
+    assert result.agree is True
+    assert result.difference == pytest.approx(1.5, abs=0.001)
+    assert result.tolerance == pytest.approx(2.0, abs=0.001)
+
+
+def test_readings_agree_at_tolerance_boundary():
+    """Readings exactly at tolerance should agree."""
+    profile = get_profile("EXAMPLE_270")
+    # tolerance = 2.0
+
+    result = readings_agree(50.0, 52.0, profile)
+
+    # difference = |50 - 52| = 2.0, which is <= 2.0
+    assert result.agree is True
+    assert result.difference == pytest.approx(2.0, abs=0.001)
+
+
+def test_readings_agree_just_over_tolerance():
+    """Readings just over tolerance should disagree."""
+    profile = get_profile("EXAMPLE_270")
+    # tolerance = 2.0
+
+    result = readings_agree(50.0, 52.1, profile)
+
+    # difference = |50 - 52.1| = 2.1, which is > 2.0
+    assert result.agree is False
+    assert result.difference == pytest.approx(2.1, abs=0.001)
+
+
+def test_readings_agree_far_apart():
+    """Readings far apart should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(20.0, 80.0, profile)
+
+    # difference = |20 - 80| = 60, which is >> 2.0
+    assert result.agree is False
+    assert result.difference == pytest.approx(60.0, abs=0.001)
+
+
+def test_readings_agree_identical():
+    """Identical readings should agree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(42.5, 42.5, profile)
+
+    # difference = 0
+    assert result.agree is True
+    assert result.difference == 0.0
+
+
+def test_readings_agree_first_none():
+    """None as first reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(None, 50.0, profile)
+
+    assert result.agree is False
+    assert result.difference is None
+    assert "First reading is None" in result.reason
+
+
+def test_readings_agree_second_none():
+    """None as second reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(50.0, None, profile)
+
+    assert result.agree is False
+    assert result.difference is None
+    assert "Second reading is None" in result.reason
+
+
+def test_readings_agree_both_none():
+    """Both None should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(None, None, profile)
+
+    assert result.agree is False
+    assert result.difference is None
+
+
+def test_readings_agree_first_nan():
+    """NaN as first reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(float("nan"), 50.0, profile)
+
+    assert result.agree is False
+    assert result.difference is None
+    assert "not finite" in result.reason
+
+
+def test_readings_agree_second_nan():
+    """NaN as second reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(50.0, float("nan"), profile)
+
+    assert result.agree is False
+    assert result.difference is None
+    assert "not finite" in result.reason
+
+
+def test_readings_agree_first_inf():
+    """Infinity as first reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree(float("inf"), 50.0, profile)
+
+    assert result.agree is False
+    assert result.difference is None
+
+
+def test_readings_agree_non_number():
+    """Non-numeric reading should disagree."""
+    profile = get_profile("EXAMPLE_270")
+
+    result = readings_agree("50", 50.0, profile)  # type: ignore
+
+    assert result.agree is False
+    assert result.difference is None
+    assert "must be a number" in result.reason
+
+
+def test_readings_agree_negative_values():
+    """Agreement check should work with negative values."""
+    profile = GaugeProfile(
+        name="negative_range",
+        unit="°C",
+        minimum_value=-50.0,
+        maximum_value=50.0,
+        minimum_angle_degrees=0.0,
+        maximum_angle_degrees=180.0,
+        agreement_tolerance_fraction=0.05,
+    )
+
+    # value range = 100, tolerance = 0.05 * 100 = 5.0
+    result = readings_agree(-10.0, -12.0, profile)
+
+    # difference = |-10 - (-12)| = 2.0, which is <= 5.0
+    assert result.agree is True
+    assert result.difference == pytest.approx(2.0, abs=0.001)
+    assert result.tolerance == pytest.approx(5.0, abs=0.001)
+
+
+# === AgreementResult tests ===
+
+
+def test_agreement_result_to_dict():
+    """AgreementResult.to_dict() should return JSON-serializable dict."""
+    result = AgreementResult(
+        agree=True,
+        difference=1.5,
+        tolerance=2.0,
+        reason="Test reason",
+    )
+
+    d = result.to_dict()
+
+    assert isinstance(d, dict)
+    assert d["agree"] is True
+    assert d["difference"] == 1.5
+    assert d["tolerance"] == 2.0
+    assert d["reason"] == "Test reason"
+
+
+def test_agreement_result_to_dict_with_none():
+    """AgreementResult.to_dict() should handle None difference."""
+    result = AgreementResult(
+        agree=False,
+        difference=None,
+        tolerance=2.0,
+        reason="Input was None",
+    )
+
+    d = result.to_dict()
+
+    assert d["agree"] is False
+    assert d["difference"] is None
+
+
+# === JSON serialization tests ===
+
+
+def test_calibration_result_to_dict_json_serializable():
+    """CalibrationResult.to_dict() output should be JSON-serializable."""
+    profile = get_profile("EXAMPLE_270")
+    result = angle_to_value(0.0, profile, angle_uncertainty_deg=5.0)
+
+    d = result.to_dict()
+
+    # Should not raise
+    json_str = json.dumps(d)
+    assert isinstance(json_str, str)
+
+    # Should be able to parse back
+    parsed = json.loads(json_str)
+    assert parsed["value"] == pytest.approx(50.0, abs=0.001)
+    assert parsed["unit"] == "units"
+    assert isinstance(parsed["flags"], list)
+
+
+def test_agreement_result_to_dict_json_serializable():
+    """AgreementResult.to_dict() output should be JSON-serializable."""
+    profile = get_profile("EXAMPLE_270")
+    result = readings_agree(50.0, 51.0, profile)
+
+    d = result.to_dict()
+
+    # Should not raise
+    json_str = json.dumps(d)
+    assert isinstance(json_str, str)
+
+    # Should be able to parse back
+    parsed = json.loads(json_str)
+    assert parsed["agree"] is True
+    assert parsed["difference"] == pytest.approx(1.0, abs=0.001)

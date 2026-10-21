@@ -285,10 +285,13 @@ def angle_to_value(
     Args:
         angle_deg: Measured needle angle in degrees. None/NaN/inf treated as invalid.
         profile: Gauge calibration profile.
-        angle_uncertainty_deg: Optional ±uncertainty in degrees (reserved for future use).
+        angle_uncertainty_deg: Optional ±uncertainty in degrees. Must be non-negative
+            and finite. Invalid uncertainty (negative/NaN/inf) is ignored with
+            flag "invalid_uncertainty".
 
     Returns:
-        CalibrationResult with value, bounds flags, and reason.
+        CalibrationResult with value, bounds flags, operating limits status, and
+        optional uncertainty range.
 
         Angle handling:
         - Within scale sweep [0, sweep]: Linear interpolation, in_bounds=True
@@ -301,13 +304,24 @@ def angle_to_value(
         - Invalid angle (None/NaN/inf/non-number): value=None, in_bounds=False,
           flag "invalid_angle"
 
+        Operating limits:
+        - If profile defines operating_min/operating_max and value is not None,
+          within_operating_limits is set based on whether value falls within range.
+        - Flag "outside_operating_limits" added when value exists but is outside range.
+        - within_operating_limits is False when no limits defined or value is None.
+
+        Uncertainty range:
+        - If angle_uncertainty_deg is valid (finite, >= 0), computes value_low/value_high
+          by propagating angle uncertainty through the linear calibration.
+        - Range is clipped to [minimum_value, maximum_value] with flag "range_clipped".
+
     Raises:
         CalibrationError: Invalid profile configuration (programmer error).
 
     Notes:
         - Never returns a reading for an angle outside the scale and margins.
         - Bad measured data returns flagged result, never raises exception.
-        - Operating limits and uncertainty ranges not yet implemented.
+        - Operating limit violation is a status flag, not an error.
     """
     # Validate profile (programmer error if invalid)
     validate_profile(profile)
@@ -363,6 +377,61 @@ def angle_to_value(
     offset = (angle_norm - profile.minimum_angle_degrees) % 360.0
     margin = profile.bounds_margin_deg
 
+    # Helper to build result with operating limits and uncertainty
+    def _build_result(value: float, at_limit: bool, at_limit_flags: list[str], reason: str) -> CalibrationResult:
+        """Build CalibrationResult with operating limits and uncertainty."""
+        result_flags = flags_list + at_limit_flags
+
+        # Check operating limits
+        within_operating = False
+        if profile.operating_min is not None and profile.operating_max is not None:
+            if profile.operating_min <= value <= profile.operating_max:
+                within_operating = True
+            else:
+                result_flags.append("outside_operating_limits")
+
+        # Compute uncertainty range
+        value_low_calc = None
+        value_high_calc = None
+        if angle_uncertainty_deg is not None:
+            # Validate uncertainty
+            if not isinstance(angle_uncertainty_deg, (int, float)) or not _is_finite(angle_uncertainty_deg):
+                result_flags.append("invalid_uncertainty")
+            elif angle_uncertainty_deg < 0:
+                result_flags.append("invalid_uncertainty")
+            else:
+                # Propagate angle uncertainty through linear calibration
+                # value_delta = (angle_uncertainty_deg / sweep) * (max_value - min_value)
+                value_range = profile.maximum_value - profile.minimum_value
+                value_delta = (angle_uncertainty_deg / sweep) * value_range
+
+                value_low_calc = value - value_delta
+                value_high_calc = value + value_delta
+
+                # Clip to scale limits
+                clipped = False
+                if value_low_calc < profile.minimum_value:
+                    value_low_calc = profile.minimum_value
+                    clipped = True
+                if value_high_calc > profile.maximum_value:
+                    value_high_calc = profile.maximum_value
+                    clipped = True
+
+                if clipped:
+                    result_flags.append("range_clipped")
+
+        return CalibrationResult(
+            value=value,
+            unit=profile.unit,
+            in_bounds=True,
+            at_scale_limit=at_limit,
+            within_operating_limits=within_operating,
+            value_low=value_low_calc,
+            value_high=value_high_calc,
+            flags=tuple(result_flags),
+            reason=reason,
+        )
+
     # Case 1: Within scale sweep [0, sweep]
     if offset <= sweep:
         fraction = offset / sweep
@@ -370,36 +439,27 @@ def angle_to_value(
 
         # Check if at scale limits (within margin of endpoints)
         at_limit = False
+        at_limit_flags = []
         if offset <= margin:
             at_limit = True
-            flags_list.append("at_scale_min")
+            at_limit_flags.append("at_scale_min")
         elif offset >= sweep - margin:
             at_limit = True
-            flags_list.append("at_scale_max")
+            at_limit_flags.append("at_scale_max")
 
-        return CalibrationResult(
+        return _build_result(
             value=value,
-            unit=profile.unit,
-            in_bounds=True,
-            at_scale_limit=at_limit,
-            within_operating_limits=False,  # TODO: implement in next prompt
-            value_low=None,  # TODO: implement uncertainty
-            value_high=None,  # TODO: implement uncertainty
-            flags=tuple(flags_list),
+            at_limit=at_limit,
+            at_limit_flags=at_limit_flags,
             reason=f"Angle {angle_norm:.1f}° mapped to value {value:.2f} {profile.unit}.",
         )
 
     # Case 2: Within margin past maximum (sweep, sweep + margin]
     if sweep < offset <= sweep + margin:
-        return CalibrationResult(
+        return _build_result(
             value=profile.maximum_value,
-            unit=profile.unit,
-            in_bounds=True,
-            at_scale_limit=True,
-            within_operating_limits=False,  # TODO: implement in next prompt
-            value_low=None,
-            value_high=None,
-            flags=tuple(flags_list + ["at_scale_max"]),
+            at_limit=True,
+            at_limit_flags=["at_scale_max"],
             reason=(
                 f"Angle {angle_norm:.1f}° is {offset - sweep:.1f}° past maximum scale angle; "
                 f"clamped to maximum value {profile.maximum_value:.2f} {profile.unit}."
@@ -408,15 +468,10 @@ def angle_to_value(
 
     # Case 3: Within margin before minimum [360 - margin, 360)
     if offset >= 360.0 - margin:
-        return CalibrationResult(
+        return _build_result(
             value=profile.minimum_value,
-            unit=profile.unit,
-            in_bounds=True,
-            at_scale_limit=True,
-            within_operating_limits=False,  # TODO: implement in next prompt
-            value_low=None,
-            value_high=None,
-            flags=tuple(flags_list + ["at_scale_min"]),
+            at_limit=True,
+            at_limit_flags=["at_scale_min"],
             reason=(
                 f"Angle {angle_norm:.1f}° is {360.0 - offset:.1f}° before minimum scale angle; "
                 f"clamped to minimum value {profile.minimum_value:.2f} {profile.unit}."
@@ -439,3 +494,136 @@ def angle_to_value(
             f"with {margin:.1f}° margin]. Dead zone; no reading available."
         ),
     )
+
+
+# === Reading Agreement ===
+
+
+@dataclass(frozen=True)
+class AgreementResult:
+    """Result from comparing two gauge readings for agreement.
+
+    Agreement within tolerance does not prove both readings are correct.
+    It only indicates they are consistent with each other.
+    """
+    agree: bool  # True if both finite and within tolerance
+    difference: float | None  # absolute difference; None if either input None/NaN
+    tolerance: float  # threshold used for agreement
+    reason: str  # human-readable explanation
+
+    def to_dict(self) -> dict:
+        """Return JSON-serializable dict (only built-in types)."""
+        return {
+            "agree": self.agree,
+            "difference": self.difference,
+            "tolerance": self.tolerance,
+            "reason": self.reason,
+        }
+
+
+def readings_agree(
+    a: float | None,
+    b: float | None,
+    profile: GaugeProfile
+) -> AgreementResult:
+    """Check if two gauge readings agree within the profile's tolerance.
+
+    Agreement within tolerance does not prove the readings are correct.
+    It only indicates consistency between retry attempts. The tolerance
+    fraction is a PROPOSED default; the team must confirm it with the
+    agent owner and justify it from labeled data uncertainty.
+
+    Args:
+        a: First reading in profile units. None/NaN => disagree.
+        b: Second reading in profile units. None/NaN => disagree.
+        profile: Gauge profile with agreement_tolerance_fraction.
+
+    Returns:
+        AgreementResult with boolean, absolute difference, tolerance threshold.
+
+        Agreement criteria:
+        - Both a and b must be finite numbers (not None, not NaN, not inf)
+        - Absolute difference |a - b| must be <= tolerance
+        - tolerance = agreement_tolerance_fraction * (max_value - min_value)
+
+    Notes:
+        - None or NaN input always results in agree=False.
+        - The tolerance fraction must be confirmed by the team based on
+          empirical measurement uncertainty from labeled gauge images.
+    """
+    # Compute tolerance threshold
+    value_range = profile.maximum_value - profile.minimum_value
+    tolerance = profile.agreement_tolerance_fraction * value_range
+
+    # Check for None inputs
+    if a is None:
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason="First reading is None; cannot assess agreement.",
+        )
+    if b is None:
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason="Second reading is None; cannot assess agreement.",
+        )
+
+    # Check for non-numeric inputs
+    if not isinstance(a, (int, float)):
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason=f"First reading must be a number, got {type(a).__name__}.",
+        )
+    if not isinstance(b, (int, float)):
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason=f"Second reading must be a number, got {type(b).__name__}.",
+        )
+
+    # Check for NaN or infinity
+    if not _is_finite(a):
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason=f"First reading is not finite (NaN or infinity): {a}.",
+        )
+    if not _is_finite(b):
+        return AgreementResult(
+            agree=False,
+            difference=None,
+            tolerance=tolerance,
+            reason=f"Second reading is not finite (NaN or infinity): {b}.",
+        )
+
+    # Both are finite numbers; compute difference
+    difference = abs(a - b)
+
+    # Check agreement
+    if difference <= tolerance:
+        return AgreementResult(
+            agree=True,
+            difference=difference,
+            tolerance=tolerance,
+            reason=(
+                f"Readings agree: |{a:.2f} - {b:.2f}| = {difference:.2f} {profile.unit}, "
+                f"within tolerance {tolerance:.2f} {profile.unit}."
+            ),
+        )
+    else:
+        return AgreementResult(
+            agree=False,
+            difference=difference,
+            tolerance=tolerance,
+            reason=(
+                f"Readings disagree: |{a:.2f} - {b:.2f}| = {difference:.2f} {profile.unit}, "
+                f"exceeds tolerance {tolerance:.2f} {profile.unit}."
+            ),
+        )
