@@ -1,0 +1,4 @@
+# Development and test dependencies.
+# Install with:  pip install -r requirements.txt -r requirements-dev.txt
+# Do NOT install this file on the deployed server.
+pytest>=8.0

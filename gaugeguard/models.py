@@ -36,3 +36,8 @@ class InspectionResult:
     reading: ReadingEstimate
     quality: ImageQuality | None
     action_log: list[AgentStep] = field(default_factory=list)
+    annotated_image: Any = None
+    needs_human: bool = False
+    attempts: list[dict[str, Any]] = field(default_factory=list)
+
+
