@@ -14,8 +14,11 @@ from gaugeguard.calibration import (
     GaugeProfile,
     UnknownProfileError,
     angle_to_value,
+    describe_profile,
     get_profile,
     normalize_angle_deg,
+    pixel_to_angle_deg,
+    profile_from_tick_points,
     readings_agree,
     validate_profile,
 )
@@ -69,6 +72,116 @@ def test_normalize_angle_infinity_raises_valueerror():
         normalize_angle_deg(float("inf"))
     with pytest.raises(ValueError, match="finite"):
         normalize_angle_deg(float("-inf"))
+
+
+def test_pixel_to_angle_deg_up_0():
+    """Up (dx=0, dy=-1) should give 0° from center."""
+    center = (0, 0)
+    point = (0, -1)
+    result = pixel_to_angle_deg(center, point)
+    assert result == pytest.approx(0.0)
+
+
+def test_pixel_to_angle_deg_right_90():
+    """Right (dx=1, dy=0) should give 90° from center."""
+    center = (0, 0)
+    point = (1, 0)
+    result = pixel_to_angle_deg(center, point)
+    assert result == pytest.approx(90.0)
+
+
+def test_pixel_to_angle_deg_down_180():
+    """Down (dx=0, dy=1) should give 180° from center."""
+    center = (0, 0)
+    point = (0, 1)
+    result = pixel_to_angle_deg(center, point)
+    assert result == pytest.approx(180.0)
+
+
+def test_pixel_to_angle_deg_left_270():
+    """Left (dx=-1, dy=0) should give 270° from center."""
+    center = (0, 0)
+    point = (-1, 0)
+    result = pixel_to_angle_deg(center, point)
+    assert result == pytest.approx(270.0)
+
+
+def test_pixel_to_angle_deg_center_raises():
+    """Point at center should raise ValueError."""
+    center = (0, 0)
+    point = (0, 0)
+    with pytest.raises(ValueError, match="Point cannot be at center"):
+        pixel_to_angle_deg(center, point)
+
+
+def test_pixel_to_angle_deg_non_finite_raises():
+    """Non-finite coordinates should raise ValueError."""
+    with pytest.raises(ValueError, match="All coordinates must be finite numbers"):
+        pixel_to_angle_deg((float("nan"), 0), (0, 0))
+
+
+def test_profile_from_tick_points_synthetic():
+    """Test profile_from_tick_points on a synthetic symmetric example.
+
+    A gauge with center at (50, 50), min tick at (50, 0) [12 o'clock, value min],
+    and max tick at (100, 50) [3 o'clock, value max].
+    These should map to 0° and 90° respectively with a 90° sweep.
+    """
+    center = (50.0, 50.0)
+    min_tick = (50.0, 0.0)   # straight up = 0° = min value
+    max_tick = (100.0, 50.0)  # right = 90° = max value
+
+    profile = profile_from_tick_points(
+        name="SYNTHETIC_90",
+        unit="units",
+        min_value=0.0,
+        max_value=100.0,
+        center_xy=center,
+        min_tick_xy=min_tick,
+        max_tick_xy=max_tick,
+    )
+
+    # Verify angles
+    assert profile.minimum_angle_degrees == pytest.approx(0.0)
+    assert profile.maximum_angle_degrees == pytest.approx(90.0)
+    # Verify sweep: 90°
+    sweep = (profile.maximum_angle_degrees - profile.minimum_angle_degrees) % 360.0
+    assert sweep == pytest.approx(90.0)
+    # Verify profile fields
+    assert profile.name == "SYNTHETIC_90"
+    assert profile.unit == "units"
+    assert profile.minimum_value == 0.0
+    assert profile.maximum_value == 100.0
+
+
+def test_describe_profile():
+    """Test describe_profile output."""
+    from gaugeguard.calibration import describe_profile
+    profile = get_profile("EXAMPLE_270")
+    desc = describe_profile(profile)
+    # Should contain key info
+    assert "EXAMPLE_270" in desc
+    assert "units" in desc
+    assert "270" in desc or "angle" in desc.lower()
+    # Check structure
+    lines = desc.strip().split("\n")
+    assert len(lines) > 0
+
+
+def test_profile_from_tick_points_degenerate():
+    """profile_from_tick_points should raise ValueError for degenerate geometry."""
+    center = (50.0, 50.0)
+    # If min_tick or max_tick is at center, pixel_to_angle_deg will raise ValueError
+    with pytest.raises(ValueError):
+        profile_from_tick_points(
+            name="DEGEN",
+            unit="units",
+            min_value=0.0,
+            max_value=100.0,
+            center_xy=center,
+            min_tick_xy=(50.0, 50.0),  # at center!
+            max_tick_xy=(100.0, 50.0),
+        )
 
 
 def test_normalize_angle_non_number_raises_typeerror():

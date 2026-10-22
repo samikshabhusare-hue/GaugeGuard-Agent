@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -627,3 +628,162 @@ def readings_agree(
                 f"exceeds tolerance {tolerance:.2f} {profile.unit}."
             ),
         )
+# === Real Gauge Profile Helpers ===
+
+def pixel_to_angle_deg(center_xy: tuple[float, float], point_xy: tuple[float, float]) -> float:
+    """Convert pixel coordinates to angle degrees using agreed convention.
+
+    Angle convention: 0° = 12 o'clock position (straight up, negative y-axis in image coordinates)
+    Direction: Clockwise positive (because image y-axis points down)
+    Formula: angle = degrees(atan2(dx, -dy)) mod 360
+
+    Args:
+        center_xy: (cx, cy) pixel coordinates of dial center
+        point_xy: (x, y) pixel coordinates of point to convert
+
+    Returns:
+        Angle in degrees [0, 360) from center to point
+
+    Raises:
+        ValueError: If point_xy == center_xy (zero vector) or if coordinates are not finite numbers
+    """
+    cx, cy = center_xy
+    x, y = point_xy
+
+    # Check for finite numbers
+    if not all(isinstance(v, (int, float)) and _is_finite(v) for v in (cx, cy, x, y)):
+        raise ValueError("All coordinates must be finite numbers")
+
+    dx = x - cx
+    dy = y - cy
+
+    if dx == 0.0 and dy == 0.0:
+        raise ValueError("Point cannot be at center - zero vector has undefined angle")
+
+    # Angle = degrees(atan2(dx, -dy)) mod 360
+    # Note: -dy accounts for image coordinates where y increases downward
+    angle_rad = math.atan2(dx, -dy)
+    angle_deg = math.degrees(angle_rad)
+
+    # Normalize to [0, 360)
+    return normalize_angle_deg(angle_deg)
+
+def profile_from_tick_points(
+    name: str,
+    unit: str,
+    min_value: float,
+    max_value: float,
+    center_xy: tuple[float, float],
+    min_tick_xy: tuple[float, float],
+    max_tick_xy: tuple[float, float],
+    **kwargs
+) -> GaugeProfile:
+    """Create a GaugeProfile from measured tick point pixel coordinates.
+
+    Args:
+        name: Profile name for registration
+        unit: Gauge unit (e.g., "PSI", "bar", "°C")
+        min_value: Minimum gauge value (printed on dial)
+        max_value: Maximum gauge value (printed on dial)
+        center_xy: (cx, cy) pixel coordinates of dial center
+        min_tick_xy: (x, y) pixel coordinates of minimum value tick (printed on dial)
+        max_tick_xy: (x, y) pixel coordinates of maximum value tick (printed on dial)
+        **kwargs: Optional GaugeProfile fields (direction, bounds_margin_deg, etc.)
+
+    Returns:
+        GaugeProfile with angles calculated from pixel coordinates
+
+    Raises:
+        ValueError: If geometry is degenerate (e.g., center == tick point)
+    """
+    # Calculate angles from pixel coordinates
+    min_angle = pixel_to_angle_deg(center_xy, min_tick_xy)
+    max_angle = pixel_to_angle_deg(center_xy, max_tick_xy)
+
+    # Create profile with provided parameters and calculated angles
+    profile = GaugeProfile(
+        name=name,
+        unit=unit,
+        minimum_value=min_value,
+        maximum_value=max_value,
+        minimum_angle_degrees=min_angle,
+        maximum_angle_degrees=max_angle,
+        **kwargs
+    )
+
+    return profile
+
+# === Profile Registry ===
+
+# Example profile for testing - NOT a real gauge model.
+# Tolerance values are placeholders pending actual gauge characterization.
+_EXAMPLE_PROFILE = GaugeProfile(
+    name="EXAMPLE_270",
+    unit="units",
+    minimum_value=0.0,
+    maximum_value=100.0,
+    minimum_angle_degrees=225.0,  # 7:30 position
+    maximum_angle_degrees=135.0,  # 4:30 position (270° sweep clockwise)
+    direction="cw",
+    bounds_margin_deg=5.0,
+    operating_min=10.0,
+    operating_max=90.0,
+    agreement_tolerance_fraction=0.02,  # placeholder: 2% of scale
+    eval_tolerance_fraction=0.05,  # placeholder: 5% of scale
+)
+
+PROFILES: dict[str, GaugeProfile] = {
+    "EXAMPLE_270": _EXAMPLE_PROFILE,
+}
+
+# Validate all registered profiles at module load
+for _profile in PROFILES.values():
+    validate_profile(_profile)
+
+def get_profile(name: str) -> GaugeProfile:
+    """Retrieve a registered gauge profile by name.
+
+    Args:
+        name: Profile identifier.
+
+    Returns:
+        The requested GaugeProfile.
+
+    Raises:
+        UnknownProfileError: Profile name not registered.
+    """
+    if name not in PROFILES:
+        raise UnknownProfileError(
+            f"Profile '{name}' not found. Available profiles: {', '.join(PROFILES.keys())}"
+        )
+    return PROFILES[name]
+
+def describe_profile(profile: GaugeProfile) -> str:
+    """Generate a report-ready summary of a gauge profile.
+
+    Args:
+        profile: The GaugeProfile to describe
+
+    Returns:
+        Human-readable description including angles, sweep, limits, and assumptions
+    """
+    sweep = (profile.maximum_angle_degrees - profile.minimum_angle_degrees) % 360.0
+
+    # Determine image reference based on profile name
+    image_ref = "unknown"
+    if "EXAMPLE" in profile.name.upper():
+        image_ref = "EXAMPLE_270 image"
+
+    return (
+        f"Gauge Profile: {profile.name}\n"
+        f"Unit: {profile.unit}\n"
+        f"Value range: {profile.minimum_value} to {profile.maximum_value} {profile.unit}\n"
+        f"Angle sweep: {sweep:.1f}° (min: {profile.minimum_angle_degrees:.1f}°, max: {profile.maximum_angle_degrees:.1f}°)\n"
+        f"Direction: {profile.direction}\n"
+        f"Bounds margin: {profile.bounds_margin_deg:.1f}°\n"
+        f"Operating limits: {profile.operating_min if profile.operating_min is not None else 'None'} to "
+        f"{profile.operating_max if profile.operating_max is not None else 'None'} {profile.unit}\n"
+        f"Agreement tolerance: {profile.agreement_tolerance_fraction * 100:.1f}% of scale\n"
+        f"Eval tolerance: {profile.eval_tolerance_fraction * 100:.1f}% of scale\n"
+        f"Assumptions: Linear scale, clockwise, measured from {image_ref}\n"
+    )
