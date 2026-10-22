@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Local data and generated artifacts
+.DS_Store
+Thumbs.db
+*.log
+outputs/
+data/private/
+data/raw/
+.aws/
+
+# Local Python environment and test cache
+.venv310/
+.pytest_cache/
+
+# Generated agent traces and outputs
+output/
+outputs/

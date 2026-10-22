@@ -1,0 +1,4 @@
+# Dependencies for Kshitij's Agent Controller role without the Streamlit UI.
+# Use Python 3.12 for the most predictable wheel compatibility.
+opencv-python-headless==5.0.0.93
+numpy>=2.0,<3

@@ -1,0 +1,12 @@
+# Production runtime dependencies.
+# Install with:  pip install -r requirements.txt
+# Development/test dependencies are in requirements-dev.txt.
+#
+# OpenCV 5 target: opencv-python-headless==5.0.0.93
+# Verified available on PyPI for Python 3.11+.
+# After installing, confirm with:
+#   python -c "import cv2; print(cv2.__version__)"
+# The printed version must start with "5." before claiming OpenCV 5 compliance.
+opencv-python-headless==5.0.0.93
+numpy>=2.0,<3
+streamlit>=1.60,<2

@@ -1,0 +1,11 @@
+flowchart LR
+    U[User / judge] --> UI[Streamlit app]
+    UI --> AG[Agent controller]
+    AG --> V[OpenCV 5 vision tools]
+    V --> Q[Quality + dial/needle evidence]
+    Q -->|clear and calibrated| R[Reading + annotated image]
+    Q -->|uncertain| AG
+    AG -->|retry evidence| V
+    AG -->|still uncertain| H[Human verification request]
+    UI --> AWS[AWS EC2: app + OpenCV workload]
+    AWS -. optional, consented output storage .-> S3[Amazon S3]
