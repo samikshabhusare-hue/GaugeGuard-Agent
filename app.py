@@ -5,6 +5,7 @@ import streamlit as st
 
 from gaugeguard.agent import inspect_upload
 from gaugeguard.calibration import PROFILES
+from gaugeguard.history import get_history_csv_text, load_history, log_inspection
 from gaugeguard.models import InspectionResult
 
 st.set_page_config(
@@ -97,8 +98,9 @@ else:
     col_btn, _ = st.columns([1, 3])
     with col_btn:
         if st.button("🔍 Analyze Gauge", type="primary", use_container_width=True):
+            result = None
             try:
-                result: InspectionResult = inspect_upload(image_bytes, profile=profile)
+                result = inspect_upload(image_bytes, profile=profile)
                 st.session_state["inspection_result"] = result
                 st.session_state["analyzed"] = True
             except ValueError as exc:
@@ -109,6 +111,23 @@ else:
                 st.error(f"Inspection Error: {exc}")
                 st.session_state["analyzed"] = False
                 st.session_state["inspection_result"] = None
+
+            # Safe, isolated logging with visible error reporting
+            if result is not None:
+                try:
+                    logged = log_inspection(
+                        result=result,
+                        filename=uploaded_file.name,
+                        calibration_profile=selected_profile_name,
+                        dedup_key=f"{uploaded_file.name}:{selected_profile_name}:{id(result)}",
+                    )
+                    if not logged:
+                        st.info("ℹ️ Inspection already recorded in audit history.")
+                except Exception as log_err:
+                    st.error(
+                        f"⚠️ **Inspection History Logging Error:** {log_err}. "
+                        "The vision inspection completed successfully, but could not be saved to inspection_history.csv."
+                    )
 
     is_analyzed = st.session_state.get("analyzed", False)
     result: InspectionResult | None = st.session_state.get("inspection_result")
@@ -345,6 +364,29 @@ else:
         else:
             st.caption("Retry telemetry will appear after image analysis.")
 
+
+
+# Inspection History Section (Renders independently of whether an image is uploaded)
+st.divider()
+st.subheader("📜 Inspection History")
+try:
+    history_records = load_history()
+    if history_records:
+        recent_records = list(reversed(history_records[-10:]))
+        st.dataframe(recent_records, use_container_width=True)
+        csv_text = get_history_csv_text()
+        st.download_button(
+            label="📥 Download Inspection History (CSV)",
+            data=csv_text,
+            file_name="inspection_history.csv",
+            mime="text/csv",
+            help="Download complete audit log of all completed inspections.",
+            key="btn_download_history_csv",
+        )
+    else:
+        st.caption("No inspection records logged yet. Completed inspections will be saved to `inspection_history.csv`.")
+except Exception as hist_err:
+    st.error(f"Error loading inspection history: {hist_err}")
 
 
 with st.expander("ℹ️ Project Status & Diagnostics"):

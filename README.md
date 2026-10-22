@@ -95,6 +95,23 @@ The primary objectives of the GaugeGuard Agent project are:
   - Step 6: `final_decision` (operating decision, status, active flags, plain-English rationale)
 - Detailed JSON payloads for each step are viewable directly in expandable cards within the dashboard.
 
+### Persistent Inspection History and Audit Logging (CSV)
+- Automatically logs all completed inspection runs to `inspection_history.csv` with a structured audit schema:
+  - `timestamp`: UTC ISO 8601 timestamp.
+  - `filename`: Original name of uploaded gauge photo.
+  - `calibration_profile`: Selected calibration profile name (e.g., `EXAMPLE_270`).
+  - `estimated_reading`: Provisional or accepted numerical gauge value.
+  - `unit`: Physical engineering unit (`units`, `psi`, `bar`, etc.).
+  - `angle_degrees`: Measured needle angle in degrees $[0, 360)$.
+  - `inspection_status`: Operational status (`accepted`, `needs_human`, `needs_retake`).
+  - `needs_human_review`: Boolean flag indicating if human escalation was required.
+  - `retry_count`: Total number of retry preprocessing passes executed ($0, 1, \dots$).
+  - `reason`: Plain-English explanation of decision, safety flags, or agreement failure.
+- In-memory composite deduplication prevents duplicate row appends during Streamlit reactive reruns.
+- Interactive history table in the dashboard displays recent inspections.
+- One-click CSV export via the **📥 Download Inspection History (CSV)** button.
+- Configurable storage directory via the `GAUGEGUARD_HISTORY_DIR` environment variable, enabling containerized persistence with Docker volumes.
+
 ---
 
 ## 5. How the Agentic Vision Workflow Works
@@ -229,14 +246,16 @@ GaugeGuard-Agent/
 │   ├── __init__.py               # Package initializer
 │   ├── agent.py                  # Agent orchestration, retry controller, and escalation gating
 │   ├── calibration.py            # Angular-to-value mapping, profile validation, and agreement checks
+│   ├── history.py                # Persistent inspection history logging, deduplication, and CSV export
 │   ├── models.py                 # Shared immutable dataclasses (ImageQuality, ReadingEstimate, etc.)
 │   └── vision.py                 # OpenCV 5 dial/needle detection, quality checks, and preprocessing
 └── tests/                        # Automated test suite
     ├── __init__.py               # Test package initializer
     ├── fixtures/
     │   └── industrial_gauge.png  # Real-world industrial gauge test fixture
-    ├── test_agent.py             # Agent orchestration and safety regression tests (19 tests)
-    ├── test_calibration.py       # Calibration math, profile validation, and limit tests (84 tests)
+    ├── test_agent.py             # Agent orchestration and safety regression tests (18 tests)
+    ├── test_calibration.py       # Calibration math, profile validation, and limit tests (85 tests)
+    ├── test_history.py           # Persistent CSV history, schema, and deduplication tests (16 tests)
     └── test_vision.py            # Dial localization, needle detection, and ambiguity tests (13 tests)
 ```
 
@@ -316,13 +335,14 @@ pytest -v
 ```
 
 ### Verified Test Suite Results
-As of the current implementation, the suite contains **116 automated tests**, all passing with zero failures:
-- **`tests/test_agent.py` (19 passed):** Verifies end-to-end agent workflow, image decoding validation, evidence-driven retry invocation, dual-pass agreement comparisons, execution trace integrity, and mandatory human review escalation for unverified demo profiles.
-- **`tests/test_calibration.py` (84 passed):** Verifies angle normalization in $[0, 360)$, profile boundary checks, linear value conversion, operating limit alerts, scale-limit margins, and reading agreement tolerance calculations.
+As of the current implementation, the suite contains **132 automated tests**, all passing with zero failures:
+- **`tests/test_agent.py` (18 passed):** Verifies end-to-end agent workflow, image decoding validation, evidence-driven retry invocation, dual-pass agreement comparisons, execution trace integrity, and mandatory human review escalation for unverified demo profiles.
+- **`tests/test_calibration.py` (85 passed):** Verifies angle normalization in $[0, 360)$, profile boundary checks, linear value conversion, operating limit alerts, scale-limit margins, and reading agreement tolerance calculations.
+- **`tests/test_history.py` (16 passed):** Verifies CSV schema compliance, append logic, header preservation, in-memory rerun deduplication, `GAUGEGUARD_HISTORY_DIR` environment path resolution, and error resilience.
 - **`tests/test_vision.py` (13 passed):** Verifies Hough circle detection, cardinal needle orientations ($0^\circ, 90^\circ, 180^\circ, 270^\circ$), blank image rejection, OpenCV 5 Hough line coordinate extraction, counterweight tail disambiguation, competing needle ambiguity checks, and the real industrial gauge fixture.
 
 ```text
-============================= 116 passed in 3.14s =============================
+============================= 132 passed in 24.71s =============================
 ```
 
 ---
@@ -336,13 +356,24 @@ The application is containerized using Docker to ensure reproducible execution a
 docker build -t gaugeguard-agent .
 ```
 
-### Run the Container
-Run the container detached with host port `8501` mapped to container port `8501`:
+### Run the Container with Persistent History Volume
+To ensure that inspection history logs persist across container restarts, image updates, and redeployments, run the container with a named Docker volume (`gaugeguard-history`) mounted to `/app/history-data` and set `GAUGEGUARD_HISTORY_DIR`:
+
 ```powershell
-docker run -d --name gaugeguard-app -p 8501:8501 gaugeguard-agent
+# 1. Create named Docker volume (optional; docker run creates automatically if omitted)
+docker volume create gaugeguard-history
+
+# 2. Run container with persistent history volume and history directory env var
+docker run -d --name gaugeguard-app `
+  -p 8501:8501 `
+  -v gaugeguard-history:/app/history-data `
+  -e GAUGEGUARD_HISTORY_DIR=/app/history-data `
+  gaugeguard-agent
 ```
 
-### Verify Container Status and Health
+*(Non-persistent execution without the volume mount is also supported for stateless evaluation: `docker run -d --name gaugeguard-app -p 8501:8501 gaugeguard-agent`)*
+
+### Verify Container Status and History Persistence
 ```powershell
 # Check container status (should display healthy after 10-15 seconds)
 docker ps --filter "name=gaugeguard-app"
@@ -352,6 +383,9 @@ docker logs -f gaugeguard-app
 
 # Probe the built-in Streamlit healthcheck endpoint
 curl http://localhost:8501/_stcore/health
+
+# Verify persistent inspection history file exists inside container volume
+docker exec gaugeguard-app python -c "from pathlib import Path; p=Path('/app/history-data/inspection_history.csv'); print('Exists:', p.exists()); print('Is file:', p.is_file()); print(p.read_text() if p.is_file() else 'No history file yet')"
 ```
 
 ### Stop and Remove the Container
@@ -392,6 +426,9 @@ Here is a step-by-step walkthrough of inspecting a physical gauge:
    - Displays a red alert: `🚨 HUMAN VERIFICATION REQUIRED: Reading calculated (66.73 units), but human review required: unverified_demo_profile`.
 9. **Examine Execution Trace:**
    - Expand the **Inspection Steps** cards in the activity panel to inspect intermediate inputs, outputs, and parameters for `quality_check`, `initial_detection`, and `calibration_mapping`.
+10. **Review and Export Inspection History:**
+   - Scroll down to the **📜 Inspection History** section to view a table of recent inspections.
+   - Click **📥 Download Inspection History (CSV)** to retrieve the complete audit log.
 
 ---
 
@@ -435,8 +472,10 @@ To ensure complete transparency for competition judges and evaluators, the repos
 - [x] Gauge calibration engine with scale bounds, operating limit checks, and wrap-around handling.
 - [x] Calibration safety gating preventing unverified demo profiles from achieving `Accepted` status.
 - [x] Structured agent action log and execution trace (`InspectionResult`, `AgentStep`).
+- [x] Persistent CSV inspection history audit log (`inspection_history.csv`) with rerun deduplication and CSV download.
+- [x] Docker volume persistence via `gaugeguard-history` mounted to `/app/history-data` (`GAUGEGUARD_HISTORY_DIR`).
 - [x] Dockerfile with healthcheck and containerized Streamlit service.
-- [x] 116 passing unit and regression tests in `pytest`.
+- [x] 132 passing unit and regression tests in `pytest`.
 
 ### Planned Future Work (Not Implemented in Current Codebase)
 - [ ] **AWS Cloud Deployment:** Production deployment on AWS EC2 with IAM roles and optional Amazon S3 consented storage is planned architecture but not yet deployed.

@@ -1,0 +1,22 @@
+# GaugeGuard Evaluation Labels Template
+# =============================================================================
+# INSTRUCTIONS FOR EVALUATION DATASET CREATION:
+# 1. Image Licensing & Consent:
+#    - Add ONLY images that are licensed for this use or captured with explicit owner consent.
+#    - Never commit private, proprietary, or unconsented images to Git.
+# 2. Image Placement:
+#    - Save image files (e.g., .jpg, .png) directly inside 'data/samples/' (or a dedicated evaluation directory).
+# 3. Label Specification:
+#    - filename: Relative path to the image file (e.g. gauge_01.jpg).
+#    - gauge_profile: Calibration profile name registered in gaugeguard (e.g. EXAMPLE_270).
+#    - ground_truth_value: Verified reference gauge reading in engineering units (e.g. 45.0).
+#    - unit: Engineering unit corresponding to the gauge scale (e.g. PSI, bar, kPa).
+#    - condition: Visual condition of the sample (clear, rotated, blurry, glare, partially_obstructed).
+#    - human_acceptable: Whether a human operator would accept this reading (true / false).
+#    - consent_license: License or consent designation (e.g. CC0, CC-BY-4.0, owner_consent).
+#    - notes: Optional context or observations about the gauge or test condition.
+# 4. Usage:
+#    - Copy this file to 'data/samples/labels.csv' and populate with verified reference data.
+#    - Run: python evaluate.py --labels data/samples/labels.csv --images-dir data/samples/
+# =============================================================================
+filename,gauge_profile,ground_truth_value,unit,condition,human_acceptable,consent_license,notes
