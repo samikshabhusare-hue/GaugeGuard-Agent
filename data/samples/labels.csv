@@ -1,1 +1,1 @@
-filename,gauge_profile,ground_truth_value,unit,condition,human_acceptable,consent_license,notes
+filename,gauge_profile,true_value,label_uncertainty,unit,condition,expected_outcome,label_source,notes

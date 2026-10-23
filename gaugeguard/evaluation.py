@@ -20,6 +20,314 @@ from gaugeguard.calibration import GaugeProfile, UnknownProfileError, get_profil
 logger = logging.getLogger(__name__)
 
 
+# === Label Record and Validation ===
+
+
+@dataclass(frozen=True)
+class LabelRecord:
+    """Validated label record from labels.csv."""
+    filename: str
+    gauge_profile: str
+    true_value: float | None
+    label_uncertainty: float
+    unit: str
+    condition: str
+    expected_outcome: str
+    label_source: str
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+VALID_CONDITIONS = {"clear", "blurry", "tilted", "dark", "obstructed", "other"}
+VALID_EXPECTED_OUTCOMES = {"read", "reject_input"}
+
+
+def load_labels(csv_path: str | Path) -> list[LabelRecord]:
+    """Load and parse labels CSV into LabelRecord objects.
+
+    Args:
+        csv_path: Path to labels.csv file.
+
+    Returns:
+        List of LabelRecord objects (one per valid data row).
+
+    Raises:
+        FileNotFoundError: If CSV file does not exist.
+        ValueError: If CSV is malformed (reports row number).
+    """
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Labels file not found: {path}")
+
+    records: list[LabelRecord] = []
+    with open(path, mode="r", encoding="utf-8-sig") as f:
+        # Filter comments and empty lines, but keep track of original line numbers
+        lines = []
+        for line_num, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                lines.append((line_num, stripped))
+
+    if not lines:
+        return records
+
+    # Check header
+    header_line_num, header_line = lines[0]
+    expected_header = "filename,gauge_profile,true_value,label_uncertainty,unit,condition,expected_outcome,label_source,notes"
+    if header_line != expected_header:
+        raise ValueError(
+            f"Row {header_line_num}: Invalid header. Expected: {expected_header}"
+        )
+
+    # Parse data rows
+    reader = csv.reader([line for _, line in lines[1:]])
+    for idx, row in enumerate(reader):
+        # Original line number = header_line_num + 1 + idx
+        orig_line_num = header_line_num + 1 + idx
+
+        # Handle trailing empty columns from trailing commas
+        while len(row) > 9 and row[-1] == "":
+            row = row[:-1]
+
+        if len(row) < 9:
+            raise ValueError(
+                f"Row {orig_line_num}: Expected 9 columns, got {len(row)}. "
+                f"Columns: filename,gauge_profile,true_value,label_uncertainty,unit,condition,expected_outcome,label_source,notes"
+            )
+
+        filename, gauge_profile, true_value_str, label_uncertainty_str, unit, condition, expected_outcome, label_source, notes = row[:9]
+
+        # Parse true_value (can be empty for reject_input)
+        true_value: float | None = None
+        if true_value_str.strip() != "":
+            try:
+                true_value = float(true_value_str)
+            except ValueError:
+                raise ValueError(
+                    f"Row {orig_line_num}: true_value '{true_value_str}' is not a valid number"
+                )
+
+        # Parse label_uncertainty
+        try:
+            label_uncertainty = float(label_uncertainty_str)
+        except ValueError:
+            raise ValueError(
+                f"Row {orig_line_num}: label_uncertainty '{label_uncertainty_str}' is not a valid number"
+            )
+
+        if label_uncertainty < 0:
+            raise ValueError(
+                f"Row {orig_line_num}: label_uncertainty must be non-negative, got {label_uncertainty}"
+            )
+
+        # Validate condition
+        if condition not in VALID_CONDITIONS:
+            raise ValueError(
+                f"Row {orig_line_num}: Unknown condition '{condition}'. Valid: {sorted(VALID_CONDITIONS)}"
+            )
+
+        # Validate expected_outcome
+        if expected_outcome not in VALID_EXPECTED_OUTCOMES:
+            raise ValueError(
+                f"Row {orig_line_num}: Unknown expected_outcome '{expected_outcome}'. Valid: {sorted(VALID_EXPECTED_OUTCOMES)}"
+            )
+
+        # Validate label_source not empty
+        if not label_source.strip():
+            raise ValueError(
+                f"Row {orig_line_num}: label_source is required and cannot be empty"
+            )
+
+        record = LabelRecord(
+            filename=filename.strip(),
+            gauge_profile=gauge_profile.strip(),
+            true_value=true_value,
+            label_uncertainty=label_uncertainty,
+            unit=unit.strip(),
+            condition=condition,
+            expected_outcome=expected_outcome,
+            label_source=label_source.strip(),
+            notes=notes.strip(),
+        )
+        records.append(record)
+
+    return records
+
+
+@dataclass
+class ValidationProblem:
+    """A validation problem found during label validation."""
+    severity: str  # "error" or "warning"
+    message: str
+    row_number: int | None = None
+    filename: str | None = None
+
+    def __str__(self) -> str:
+        parts = []
+        if self.row_number is not None:
+            parts.append(f"Row {self.row_number}")
+        if self.filename:
+            parts.append(f"({self.filename})")
+        parts.append(f"[{self.severity.upper()}] {self.message}")
+        return " ".join(parts)
+
+
+def validate_labels(records: list[LabelRecord], images_dir: str | Path) -> list[ValidationProblem]:
+    """Validate label records against registered profiles and image files.
+
+    Args:
+        records: List of LabelRecord objects from load_labels().
+        images_dir: Directory containing image files.
+
+    Returns:
+        List of ValidationProblem objects (empty if all valid).
+    """
+    problems: list[ValidationProblem] = []
+    images_path = Path(images_dir)
+
+    # Check for duplicate filenames
+    seen_filenames: dict[str, int] = {}
+    for idx, rec in enumerate(records):
+        if rec.filename in seen_filenames:
+            problems.append(ValidationProblem(
+                severity="error",
+                message=f"Duplicate filename '{rec.filename}' (first seen at row {seen_filenames[rec.filename] + 1})",
+                row_number=idx + 1,
+                filename=rec.filename,
+            ))
+        else:
+            seen_filenames[rec.filename] = idx
+
+    # Validate each record
+    for idx, rec in enumerate(records):
+        row_num = idx + 1  # Data row number (1-indexed after header)
+
+        # Check file exists
+        img_path = images_path / rec.filename
+        if not img_path.is_file():
+            problems.append(ValidationProblem(
+                severity="error",
+                message=f"Image file not found: {img_path}",
+                row_number=row_num,
+                filename=rec.filename,
+            ))
+
+        # Check gauge profile exists
+        try:
+            profile = get_profile(rec.gauge_profile)
+        except UnknownProfileError:
+            problems.append(ValidationProblem(
+                severity="error",
+                message=f"Unknown gauge profile '{rec.gauge_profile}'. Available: {', '.join(sorted(get_profile.__globals__['PROFILES'].keys()))}",
+                row_number=row_num,
+                filename=rec.filename,
+            ))
+            continue  # Skip further checks for this record if profile unknown
+
+        profile = get_profile(rec.gauge_profile)
+
+        # Check true_value presence for "read" outcome
+        if rec.expected_outcome == "read":
+            if rec.true_value is None:
+                problems.append(ValidationProblem(
+                    severity="error",
+                    message="true_value is required when expected_outcome == 'read'",
+                    row_number=row_num,
+                    filename=rec.filename,
+                ))
+            else:
+                # Check value within profile range
+                if not (profile.minimum_value <= rec.true_value <= profile.maximum_value):
+                    problems.append(ValidationProblem(
+                        severity="error",
+                        message=f"true_value {rec.true_value} outside profile range [{profile.minimum_value}, {profile.maximum_value}]",
+                        row_number=row_num,
+                        filename=rec.filename,
+                    ))
+        elif rec.expected_outcome == "reject_input":
+            # true_value must be None/empty for reject_input
+            if rec.true_value is not None:
+                problems.append(ValidationProblem(
+                    severity="error",
+                    message="true_value must be empty when expected_outcome == 'reject_input'",
+                    row_number=row_num,
+                    filename=rec.filename,
+                ))
+
+        # Check unit matches profile
+        if rec.unit != profile.unit:
+            problems.append(ValidationProblem(
+                severity="warning",
+                message=f"Unit '{rec.unit}' does not match profile unit '{profile.unit}'",
+                row_number=row_num,
+                filename=rec.filename,
+            ))
+
+        # Check condition is valid (already validated in load_labels, but double-check)
+        if rec.condition not in VALID_CONDITIONS:
+            problems.append(ValidationProblem(
+                severity="error",
+                message=f"Invalid condition '{rec.condition}'",
+                row_number=row_num,
+                filename=rec.filename,
+            ))
+
+    # Check for unlabeled images in images_dir
+    labeled_files = {rec.filename for rec in records}
+    for img_file in images_path.iterdir():
+        if img_file.is_file() and img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}:
+            if img_file.name not in labeled_files:
+                problems.append(ValidationProblem(
+                    severity="warning",
+                    message=f"Image file has no label row in labels.csv: {img_file.name}",
+                    row_number=None,
+                    filename=img_file.name,
+                ))
+
+    return problems
+
+
+def validate_labels_cli(csv_path: str | Path, images_dir: str | Path) -> int:
+    """CLI entry point for label validation.
+
+    Returns:
+        Exit code: 0 if valid (no errors), 1 if errors found.
+    """
+    try:
+        records = load_labels(csv_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[ERROR] {e}")
+        return 1
+
+    if not records:
+        print("Validation result: 0 labelled images (header-only CSV)")
+        return 0
+
+    problems = validate_labels(records, images_dir)
+
+    errors = [p for p in problems if p.severity == "error"]
+    warnings = [p for p in problems if p.severity == "warning"]
+
+    if errors:
+        print(f"Validation FAILED: {len(errors)} error(s), {len(warnings)} warning(s)")
+        for prob in errors:
+            print(f"  {prob}")
+        for prob in warnings:
+            print(f"  {prob}")
+        return 1
+
+    if warnings:
+        print(f"Validation PASSED with {len(warnings)} warning(s):")
+        for prob in warnings:
+            print(f"  {prob}")
+    else:
+        print(f"Validation PASSED: {len(records)} labelled image(s), no issues")
+
+    return 0
+
+
 def compute_mae(
     predictions: Sequence[float],
     ground_truths: Sequence[float],
@@ -537,8 +845,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Output evaluation summary directly as JSON.",
     )
+    parser.add_argument(
+        "--validate-labels",
+        action="store_true",
+        help="Validate labels CSV against images directory and registered profiles (no evaluation run).",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.validate_labels:
+        return validate_labels_cli(args.labels, args.images_dir)
 
     metrics = evaluate_dataset(
         labels_path=args.labels,
