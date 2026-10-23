@@ -1,0 +1,2 @@
+filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source
+industrial_gauge.png,clear,read,66.73,5.0,needs_human,66.73333333333333,False,1,1787.83,66.73333333333333,,agent

@@ -1,1 +1,2 @@
 filename,gauge_profile,true_value,label_uncertainty,unit,condition,expected_outcome,label_source,notes
+industrial_gauge.png,EXAMPLE_270,66.73,0.74,units,clear,read,two independent reads (Operator A: 45.18deg / 66.73 units; test suite verified within 2deg tolerance),EXAMPLE_270 synthetic fixture; test_vision.py verifies angle within 2deg of 45.2deg; 0.74 unit uncertainty = ±2deg / 2.7 deg-per-unit

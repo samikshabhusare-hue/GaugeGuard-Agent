@@ -1,0 +1,104 @@
+{
+  "agent": {
+    "n_total": 1,
+    "n_evaluable": 1,
+    "n_accepted": 0,
+    "n_needs_human": 1,
+    "n_errors": 0,
+    "n_rejected_input": 0,
+    "coverage": [
+      0.0,
+      0,
+      1
+    ],
+    "mae": [
+      null,
+      0
+    ],
+    "within_tolerance_rate": [
+      null,
+      0,
+      0
+    ],
+    "incorrect_acceptance_rate": [
+      null,
+      0,
+      0
+    ],
+    "retry_rate": [
+      0.0,
+      0,
+      1
+    ],
+    "escalation_rate": [
+      1.0,
+      1,
+      1
+    ],
+    "correct_rejection_rate": [
+      null,
+      0,
+      0
+    ],
+    "false_rejection_count": 0,
+    "latency_summary": {
+      "n": 1,
+      "mean": 1787.83,
+      "median": 1787.83,
+      "p95": 1787.83,
+      "p95_unreliable": true
+    },
+    "note": "n_accepted=0: within_tolerance_rate and incorrect_acceptance_rate undefined"
+  },
+  "baseline": {
+    "n_total": 1,
+    "n_evaluable": 1,
+    "n_accepted": 1,
+    "n_needs_human": 0,
+    "n_errors": 0,
+    "n_rejected_input": 0,
+    "coverage": [
+      1.0,
+      1,
+      1
+    ],
+    "mae": [
+      0.0033333333333303017,
+      1
+    ],
+    "within_tolerance_rate": [
+      1.0,
+      1,
+      1
+    ],
+    "incorrect_acceptance_rate": [
+      0.0,
+      0,
+      1
+    ],
+    "retry_rate": [
+      0.0,
+      0,
+      1
+    ],
+    "escalation_rate": [
+      0.0,
+      0,
+      1
+    ],
+    "correct_rejection_rate": [
+      null,
+      0,
+      0
+    ],
+    "false_rejection_count": 0,
+    "latency_summary": {
+      "n": 1,
+      "mean": 1787.83,
+      "median": 1787.83,
+      "p95": 1787.83,
+      "p95_unreliable": true
+    },
+    "note": "all denominators > 0"
+  }
+}

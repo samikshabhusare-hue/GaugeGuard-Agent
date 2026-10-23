@@ -1,0 +1,66 @@
+[
+  {
+    "step_name": "image_quality",
+    "method": "opencv_laplacian_and_contrast",
+    "reason": "Evaluate blur variance, contrast standard deviation, and image resolution.",
+    "output_summary": {
+      "flags": [],
+      "blur_score": 408.7,
+      "contrast_score": 56.4,
+      "width": 1269,
+      "height": 1239
+    }
+  },
+  {
+    "step_name": "initial_detection",
+    "method": "detect_dial_and_needle_default",
+    "reason": "First-pass dial localization and needle angle estimation.",
+    "output_summary": {
+      "attempt": 1,
+      "method": "default",
+      "success": true,
+      "center": [
+        629.4,
+        556.2
+      ],
+      "radius": 454.3,
+      "angle_degrees": 45.18,
+      "confidence": 0.75,
+      "flags": [],
+      "reason": "Needle detected at angle 45.2\u00b0 with center (629.4, 556.2) and radius 454.3px."
+    }
+  },
+  {
+    "step_name": "calibration_mapping",
+    "method": "linear_angle_to_value",
+    "reason": "Map detected angle 45.2\u00b0 to engineering value using profile 'EXAMPLE_270'.",
+    "output_summary": {
+      "value": 66.73333333333333,
+      "unit": "units",
+      "in_bounds": true,
+      "at_scale_limit": false,
+      "within_operating_limits": true,
+      "flags": [
+        "linear_scale_assumed",
+        "unverified_demo_profile"
+      ],
+      "reason": "Angle 45.2\u00b0 mapped to value 66.73 units."
+    }
+  },
+  {
+    "step_name": "final_decision",
+    "method": "quality_gated_acceptance",
+    "reason": "Reading calculated (66.73 units), but human review required: unverified_demo_profile",
+    "output_summary": {
+      "decision": "needs_human",
+      "reason": "Reading calculated (66.73 units), but human review required: unverified_demo_profile",
+      "needs_human": true,
+      "value": 66.73333333333333,
+      "unit": "units",
+      "confidence": 0.75,
+      "flags": [
+        "unverified_demo_profile"
+      ]
+    }
+  }
+]
