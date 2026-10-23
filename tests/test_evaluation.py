@@ -27,6 +27,8 @@ from gaugeguard.evaluation import (
     load_image_bgr,
     load_labels,
     main,
+    make_report,
+    compare_runs,
     parse_boolean,
     run_evaluation,
     run_pipeline,
@@ -573,3 +575,181 @@ def test_cli_run_missing_labels_and_empty_label_set(tmp_path: Path, capsys):
     captured_empty = capsys.readouterr()
     assert "Empty label set" in captured_empty.out
     assert "Refusing to write metrics" in captured_empty.out
+
+
+def test_make_report_with_fixture_results(tmp_path: Path):
+    """Verify make_report generates report_tables.md with counts, Wilson intervals, and failures."""
+    fixture_dir = tmp_path / "test_fixture_results"
+    fixture_dir.mkdir()
+
+    # Create records.csv with known failures:
+    # 1. Clear correct accepted
+    # 2. Wrong accepted reading (|err| > tol: reading 60.0 vs true 50.0, tol 2.5)
+    # 3. Escalated to human
+    # 4. Pipeline error
+    # 5. False rejection (expected read, got rejected_input)
+    # 6. Missed escalation on obstructed image (obstructed, accepted)
+    records_content = (
+        "filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source\n"
+        "g_correct.png,clear,read,50.0,2.5,accepted,50.5,False,1,120.5,50.5,,agent\n"
+        "g_wrong_acc.png,clear,read,50.0,2.5,accepted,60.0,False,1,130.0,60.0,,agent\n"
+        "g_escalated.png,blurry,read,70.0,2.5,needs_human,72.0,True,2,250.0,72.0,,agent\n"
+        "g_error.png,dark,read,30.0,2.5,error,,,0,15.0,,Harness crash,harness\n"
+        "g_false_rej.png,clear,read,40.0,2.5,rejected_input,,,0,12.0,,Image corrupt,harness\n"
+        "g_obstructed.png,obstructed,read,80.0,2.5,accepted,81.0,False,1,140.0,81.0,,agent\n"
+    )
+    (fixture_dir / "records.csv").write_text(records_content, encoding="utf-8")
+
+    # metrics.json
+    metrics_payload = {
+        "agent": {
+            "n_total": 6,
+            "n_evaluable": 5,
+            "n_accepted": 3,
+            "n_needs_human": 1,
+            "n_errors": 1,
+            "n_rejected_input": 1,
+        },
+        "baseline": {
+            "n_total": 6,
+            "n_evaluable": 6,
+            "n_accepted": 4,
+            "mae": [4.0, 4],
+            "within_tolerance_rate": [0.75, 3, 4],
+            "incorrect_acceptance_rate": [0.25, 1, 4],
+        },
+    }
+    (fixture_dir / "metrics.json").write_text(json.dumps(metrics_payload), encoding="utf-8")
+
+    # environment.json
+    env_payload = {
+        "platform": "Linux-test-x86_64",
+        "python_version": "3.13.0 test",
+        "cv2_version": "5.0.0",
+        "numpy_version": "2.4.0",
+        "EC2_INSTANCE_TYPE": "c6i.xlarge",
+        "GAUGEGUARD_RUN_LABEL": "test-ec2",
+    }
+    (fixture_dir / "environment.json").write_text(json.dumps(env_payload), encoding="utf-8")
+
+    # action_logs.json
+    action_logs_payload = {
+        "g_escalated.png": [
+            {
+                "step_name": "final_decision",
+                "output_summary": {"flags": ["possible_blur"], "reason": "Low blur score", "needs_human": True},
+            }
+        ]
+    }
+    (fixture_dir / "action_logs.json").write_text(json.dumps(action_logs_payload), encoding="utf-8")
+
+    report_path = make_report(fixture_dir)
+    assert report_path.is_file()
+
+    content = report_path.read_text(encoding="utf-8")
+
+    # Check sections exist
+    assert "## 1. Overall Metrics: Agent vs Baseline" in content
+    assert "## 2. Per-Condition Performance Breakdown" in content
+    assert "## 3. Human Escalation Table" in content
+    assert "## 4. Failure Cases" in content
+    assert "## 5. Latency & Environment Summary" in content
+
+    # Check table contains counts (e.g., (3/5)) and Wilson intervals [...]
+    assert "(3/5)" in content
+    assert "[" in content and "%]" in content
+
+    # Check failure cases table includes wrong accepted reading
+    assert "g_wrong_acc.png" in content
+    assert "Wrong Accepted Reading" in content
+    assert "60.00" in content
+
+    # Check other failures included
+    assert "g_error.png" in content
+    assert "Pipeline Error" in content
+    assert "g_false_rej.png" in content
+    assert "False Rejection" in content
+    assert "g_obstructed.png" in content
+    assert "Missed Escalation" in content
+
+    # Check escalation table contains reason
+    assert "g_escalated.png" in content
+    assert "possible_blur" in content
+
+    # Check note stating sample size and non-generalizability on each table
+    note_str = "*Note: Sample size n = 6. Results do not generalize beyond this gauge and these images.*"
+    assert content.count(note_str) >= 4
+
+
+def test_compare_runs_mismatched_and_small_n(tmp_path: Path):
+    """Verify compare_runs warns on mismatched labelled sets and small sample size (n < 20)."""
+    dir_a = tmp_path / "local"
+    dir_b = tmp_path / "ec2"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    # Run A records: img1, img2
+    recs_a = (
+        "filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source\n"
+        "img1.png,clear,read,50.0,2.5,accepted,50.1,False,1,100.0,50.1,,agent\n"
+        "img2.png,clear,read,20.0,2.5,accepted,20.2,False,1,120.0,20.2,,agent\n"
+    )
+    (dir_a / "records.csv").write_text(recs_a, encoding="utf-8")
+    (dir_a / "environment.json").write_text(json.dumps({"platform": "Win", "cv2_version": "5.0.0"}), encoding="utf-8")
+
+    # Run B records: img1, img3 (mismatched!)
+    recs_b = (
+        "filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source\n"
+        "img1.png,clear,read,50.0,2.5,accepted,50.0,False,1,50.0,50.0,,agent\n"
+        "img3.png,clear,read,30.0,2.5,accepted,30.1,False,1,55.0,30.1,,agent\n"
+    )
+    (dir_b / "records.csv").write_text(recs_b, encoding="utf-8")
+    (dir_b / "environment.json").write_text(json.dumps({"platform": "Linux", "cv2_version": "5.0.0", "EC2_INSTANCE_TYPE": "t3.medium"}), encoding="utf-8")
+
+    cmp_md = compare_runs(dir_a, dir_b)
+
+    # Check warnings
+    assert "Labelled sets differ" in cmp_md
+    assert "Small sample size" in cmp_md
+    assert "n < 20" in cmp_md
+
+    # Check environment comparison table
+    assert "t3.medium" in cmp_md
+
+    # Check latency comparison table
+    assert "Mean" in cmp_md
+    assert "Ratio" in cmp_md
+
+    # Check note stating sample size
+    assert "*Note: Sample size n_A = 2, n_B = 2. Results do not generalize beyond this gauge and these images.*" in cmp_md
+
+
+def test_cli_report_and_compare(tmp_path: Path, capsys):
+    """Verify CLI --report and --compare flags execute cleanly."""
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir()
+    (run_dir / "records.csv").write_text(
+        "filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source\n"
+        "img1.png,clear,read,50.0,2.5,accepted,50.0,False,1,80.0,50.0,,agent\n",
+        encoding="utf-8",
+    )
+    (run_dir / "environment.json").write_text("{}", encoding="utf-8")
+
+    # CLI --report
+    exit_report = main(["--report", str(run_dir)])
+    assert exit_report == 0
+    assert (run_dir / "report_tables.md").is_file()
+
+    # CLI --compare
+    run_dir2 = tmp_path / "run2"
+    run_dir2.mkdir()
+    (run_dir2 / "records.csv").write_text(
+        "filename,condition,expected_outcome,true_value,tolerance,status,reading,retried,attempts,latency_ms,first_pass_reading,error_message,source\n"
+        "img1.png,clear,read,50.0,2.5,accepted,50.0,False,1,40.0,50.0,,agent\n",
+        encoding="utf-8",
+    )
+    exit_cmp = main(["--compare", str(run_dir), str(run_dir2)])
+    assert exit_cmp == 0
+    captured = capsys.readouterr()
+    assert "Comparison of Evaluation Runs" in captured.out
+

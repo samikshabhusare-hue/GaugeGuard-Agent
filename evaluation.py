@@ -3,7 +3,8 @@
 
 Usage:
     python evaluation.py --run --out evaluation_results/local/
-    python evaluation.py --labels data/samples/labels.csv --images-dir data/samples/
+    python evaluation.py --report evaluation_results/local/
+    python evaluation.py --compare evaluation_results/local/ evaluation_results/ec2/
 """
 
 import sys
@@ -14,6 +15,8 @@ from gaugeguard.evaluation import (
     capture_environment,
     compute_baseline_metrics,
     run_evaluation,
+    make_report,
+    compare_runs,
     main,
 )
 

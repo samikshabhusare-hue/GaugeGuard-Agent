@@ -1,6 +1,6 @@
 # CLAUDE.md — GaugeGuard Agent
 
-> **Auto-updated on each commit.** Last sync: 2026-10-23 (commit 936bf52)
+> **Auto-updated on each commit.** Last sync: 2026-10-23 (commit 104a17a)
 
 ---
 

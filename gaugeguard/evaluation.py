@@ -548,7 +548,7 @@ def compute_metrics(records: Sequence[EvalRecord]) -> dict[str, Any]:
     n_total = len(recs)
     n_evaluable = sum(1 for r in recs if r.status != "error")
     n_accepted = sum(1 for r in recs if r.status == "accepted")
-    n_needs_human = sum(1 for r in recs if r.status == "needs_human")
+    n_needs_human = sum(1 for r in recs if r.status in ("needs_human", "needs_retake"))
     n_errors = sum(1 for r in recs if r.status == "error")
     n_rejected_input = sum(1 for r in recs if r.status == "rejected_input")
 
@@ -895,6 +895,533 @@ def parse_boolean(val: Any) -> bool | None:
     if s in ("false", "0", "no", "n", "f"):
         return False
     return None
+
+
+# === Report Generation & Run Comparison ===
+
+
+def _format_rate_with_ci(num: int, denom: int, z: float = 1.96) -> str:
+    """Format rate with count (num/denom) and Wilson confidence interval."""
+    if denom == 0:
+        return "N/A (0/0)"
+    pct = (num / denom) * 100.0
+    ci = wilson_interval(num, denom, z=z)
+    if ci is None:
+        return f"{pct:.1f}% ({num}/{denom})"
+    low_pct = ci[0] * 100.0
+    high_pct = ci[1] * 100.0
+    return f"{pct:.1f}% ({num}/{denom}) [{low_pct:.1f}%, {high_pct:.1f}%]"
+
+
+def make_report(results_dir: str | Path) -> Path:
+    """Generate report_tables.md from an evaluation run directory.
+
+    Includes:
+    1) Overall metrics table with counts and Wilson intervals, agent vs baseline
+    2) Per-condition table
+    3) Escalation table with reasons and flags from action logs
+    4) Failure cases table (wrong accepted, errors, false rejections, missed escalations)
+    5) Latency summary with n and environment metadata
+
+    Each table ends with a note stating sample size and that results do not
+    generalize beyond this gauge and these images.
+    """
+    res_path = Path(results_dir)
+    records_file = res_path / "records.csv"
+    metrics_file = res_path / "metrics.json"
+    env_file = res_path / "environment.json"
+    action_logs_file = res_path / "action_logs.json"
+
+    if not records_file.is_file():
+        raise FileNotFoundError(f"records.csv not found in {res_path}")
+
+    # Load records
+    records: list[dict[str, Any]] = []
+    with open(records_file, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            records.append({
+                "filename": row["filename"],
+                "condition": row.get("condition", "unspecified"),
+                "expected_outcome": row.get("expected_outcome", "read"),
+                "true_value": float(row["true_value"]) if row.get("true_value") not in ("", None) else None,
+                "tolerance": float(row["tolerance"]) if row.get("tolerance") not in ("", None) else 5.0,
+                "status": row.get("status", "error"),
+                "reading": float(row["reading"]) if row.get("reading") not in ("", None) else None,
+                "retried": parse_boolean(row.get("retried")) is True,
+                "attempts": int(row["attempts"]) if row.get("attempts") not in ("", None) else 1,
+                "latency_ms": float(row["latency_ms"]) if row.get("latency_ms") not in ("", None) else None,
+                "first_pass_reading": float(row["first_pass_reading"]) if row.get("first_pass_reading") not in ("", None) else None,
+                "error_message": row.get("error_message", ""),
+                "source": row.get("source", "agent"),
+            })
+
+    # Load metrics if present
+    metrics_data: dict[str, Any] = {}
+    if metrics_file.is_file():
+        try:
+            metrics_data = json.loads(metrics_file.read_text(encoding="utf-8"))
+        except Exception:
+            metrics_data = {}
+
+    baseline_metrics = metrics_data.get("baseline", {})
+
+    # Load environment if present
+    env_data: dict[str, Any] = {}
+    if env_file.is_file():
+        try:
+            env_data = json.loads(env_file.read_text(encoding="utf-8"))
+        except Exception:
+            env_data = {}
+
+    # Load action logs if present
+    action_logs_map: dict[str, Any] = {}
+    if action_logs_file.is_file():
+        try:
+            action_logs_map = json.loads(action_logs_file.read_text(encoding="utf-8"))
+        except Exception:
+            action_logs_map = {}
+
+    n_total = len(records)
+    n_evaluable = sum(1 for r in records if r["status"] != "error")
+    n_accepted = sum(1 for r in records if r["status"] == "accepted")
+    n_escalated = sum(1 for r in records if r["status"] in ("needs_human", "needs_retake"))
+    n_errors = sum(1 for r in records if r["status"] == "error")
+    n_rejected = sum(1 for r in records if r["status"] == "rejected_input")
+    n_retried = sum(1 for r in records if r["retried"])
+
+    sample_size_note = (
+        f"*Note: Sample size n = {n_total}. Results do not generalize beyond this gauge and these images.*"
+    )
+
+    lines: list[str] = [
+        f"# GaugeGuard Evaluation Report: `{res_path.name}`",
+        "",
+        f"Generated from run output in `{res_path}`.",
+        "",
+    ]
+
+    # --- 1) Overall Metrics Table ---
+    lines.append("## 1. Overall Metrics: Agent vs Baseline")
+    lines.append("")
+    lines.append("| Metric | Agent Result | Baseline (First-Pass Only) | Definition |")
+    lines.append("|:---|:---|:---|:---|")
+
+    agent_cov = _format_rate_with_ci(n_accepted, n_evaluable)
+    agent_accepted_with_truth = [
+        r for r in records
+        if r["status"] == "accepted" and r["true_value"] is not None and r["reading"] is not None
+    ]
+    agent_mae = (
+        f"{statistics.mean(abs(r['reading'] - r['true_value']) for r in agent_accepted_with_truth):.2f} (n={len(agent_accepted_with_truth)})"
+        if agent_accepted_with_truth else "N/A (n=0)"
+    )
+    n_agent_within = sum(1 for r in agent_accepted_with_truth if abs(r["reading"] - r["true_value"]) <= r["tolerance"])
+    agent_within = _format_rate_with_ci(n_agent_within, n_accepted)
+
+    n_agent_incorrect = sum(1 for r in agent_accepted_with_truth if abs(r["reading"] - r["true_value"]) > r["tolerance"])
+    agent_incorrect = _format_rate_with_ci(n_agent_incorrect, n_accepted)
+
+    agent_retry = _format_rate_with_ci(n_retried, n_evaluable)
+    agent_escalation = _format_rate_with_ci(n_escalated, n_evaluable)
+
+    # Baseline numbers
+    if isinstance(baseline_metrics, dict) and baseline_metrics:
+        base_n_acc = baseline_metrics.get("n_accepted", 0)
+        base_n_eval = baseline_metrics.get("n_evaluable", n_total)
+        base_cov = _format_rate_with_ci(base_n_acc, base_n_eval)
+        base_mae_val = baseline_metrics.get("mae", (None, 0))[0]
+        base_mae_count = baseline_metrics.get("mae", (None, 0))[1]
+        base_mae = f"{base_mae_val:.2f} (n={base_mae_count})" if base_mae_val is not None else "N/A (n=0)"
+        base_within_num = baseline_metrics.get("within_tolerance_rate", (None, 0, base_n_acc))[1]
+        base_within = _format_rate_with_ci(base_within_num, base_n_acc)
+        base_inc_num = baseline_metrics.get("incorrect_acceptance_rate", (None, 0, base_n_acc))[1]
+        base_incorrect = _format_rate_with_ci(base_inc_num, base_n_acc)
+        base_retry = f"0.0% (0/{base_n_eval})"
+        base_escalation = f"0.0% (0/{base_n_eval})"
+    else:
+        base_cov = "not available"
+        base_mae = "not available"
+        base_within = "not available"
+        base_incorrect = "not available"
+        base_retry = "not available"
+        base_escalation = "not available"
+
+    lines.append(f"| **Coverage** | {agent_cov} | {base_cov} | Accepted readings / Evaluable samples |")
+    lines.append(f"| **Mean Absolute Error (MAE)** | {agent_mae} | {base_mae} | Mean error on accepted readings with ground truth |")
+    lines.append(f"| **Within-Tolerance Rate** | {agent_within} | {base_within} | Accepted readings with error ≤ tolerance / Accepted |")
+    lines.append(f"| **Incorrect Acceptance Rate** | {agent_incorrect} | {base_incorrect} | Accepted readings with error > tolerance / Accepted |")
+    lines.append(f"| **Retry Rate** | {agent_retry} | {base_retry} | Inspections requiring retry pass / Evaluable |")
+    lines.append(f"| **Human Escalation Rate** | {agent_escalation} | {base_escalation} | Inspections routed to human review / Evaluable |")
+    lines.append(f"| **Harness / Agent Errors** | {n_errors} ({n_errors/n_total*100:.1f}%) | N/A | Processing failures / Total |")
+    lines.append(f"| **Rejected Inputs** | {n_rejected} ({n_rejected/n_total*100:.1f}%) | N/A | Corrupt/unreadable inputs rejected / Total |")
+    lines.append("")
+    lines.append(sample_size_note)
+    lines.append("")
+
+    # --- 2) Per-Condition Table ---
+    lines.append("## 2. Per-Condition Performance Breakdown")
+    lines.append("")
+    lines.append("| Condition | Total (n) | Accepted | Coverage (95% CI) | Escalated | MAE | Within Tol (95% CI) | Errors | Rejected |")
+    lines.append("|:---|:---|:---|:---|:---|:---|:---|:---|:---|")
+
+    cond_groups: dict[str, list[dict[str, Any]]] = {}
+    for r in records:
+        cond_groups.setdefault(r["condition"], []).append(r)
+
+    for cond, group in sorted(cond_groups.items()):
+        c_total = len(group)
+        c_eval = sum(1 for r in group if r["status"] != "error")
+        c_acc = sum(1 for r in group if r["status"] == "accepted")
+        c_esc = sum(1 for r in group if r["status"] in ("needs_human", "needs_retake"))
+        c_err = sum(1 for r in group if r["status"] == "error")
+        c_rej = sum(1 for r in group if r["status"] == "rejected_input")
+
+        c_cov_str = _format_rate_with_ci(c_acc, c_eval)
+        c_acc_truth = [r for r in group if r["status"] == "accepted" and r["true_value"] is not None and r["reading"] is not None]
+        c_mae_str = f"{statistics.mean(abs(r['reading'] - r['true_value']) for r in c_acc_truth):.2f}" if c_acc_truth else "N/A"
+        c_within_num = sum(1 for r in c_acc_truth if abs(r["reading"] - r["true_value"]) <= r["tolerance"])
+        c_within_str = _format_rate_with_ci(c_within_num, c_acc)
+
+        lines.append(
+            f"| `{cond}` | {c_total} | {c_acc} | {c_cov_str} | {c_esc} | {c_mae_str} | {c_within_str} | {c_err} | {c_rej} |"
+        )
+
+    lines.append("")
+    lines.append(sample_size_note)
+    lines.append("")
+
+    # --- 3) Escalation Table ---
+    lines.append("## 3. Human Escalation Table")
+    lines.append("")
+    lines.append("Images routed to human review (`needs_human` / `needs_retake`), with triggering flags and rationale:")
+    lines.append("")
+    lines.append("| Filename | Condition | Attempts | Reading | Triggering Flags / Rationale |")
+    lines.append("|:---|:---|:---|:---|:---|")
+
+    escalated_recs = [r for r in records if r["status"] in ("needs_human", "needs_retake")]
+    if escalated_recs:
+        for r in escalated_recs:
+            fn = r["filename"]
+            read_str = f"{r['reading']:.2f}" if r["reading"] is not None else "None"
+            flags_or_reasons: list[str] = []
+            if fn in action_logs_map:
+                for step in action_logs_map[fn]:
+                    out_sum = step.get("output_summary", {})
+                    if "flags" in out_sum and out_sum["flags"]:
+                        flags_or_reasons.extend(out_sum["flags"])
+                    if "reason" in out_sum and out_sum["reason"]:
+                        flags_or_reasons.append(out_sum["reason"])
+                    if "decision" in out_sum and out_sum.get("needs_human"):
+                        flags_or_reasons.append(f"decision: {out_sum['decision']}")
+            if r["error_message"]:
+                flags_or_reasons.append(r["error_message"])
+
+            dedup_reasons: list[str] = []
+            for item in flags_or_reasons:
+                item_clean = str(item).strip()
+                if item_clean and item_clean not in dedup_reasons:
+                    dedup_reasons.append(item_clean)
+
+            reason_str = "; ".join(dedup_reasons) if dedup_reasons else r["status"]
+            lines.append(f"| `{fn}` | `{r['condition']}` | {r['attempts']} | {read_str} | {reason_str} |")
+    else:
+        lines.append("| *None* | - | - | - | No images routed to human review (0 escalations) |")
+
+    lines.append("")
+    lines.append(sample_size_note)
+    lines.append("")
+
+    # --- 4) Failure Cases Table ---
+    lines.append("## 4. Failure Cases")
+    lines.append("")
+    lines.append("Detailed analysis of failure events: wrong accepted readings, errors, false rejections, and missed escalations.")
+    lines.append("")
+    lines.append("| Filename | Failure Category | Predicted | True Value | Absolute Error | Tolerance | Reason / Description |")
+    lines.append("|:---|:---|:---|:---|:---|:---|:---|")
+
+    failures: list[dict[str, Any]] = []
+
+    for r in records:
+        # a) Accepted reading that was wrong (|err| > tol)
+        if r["status"] == "accepted" and r["true_value"] is not None and r["reading"] is not None:
+            err = abs(r["reading"] - r["true_value"])
+            if err > r["tolerance"]:
+                failures.append({
+                    "filename": r["filename"],
+                    "category": "Wrong Accepted Reading",
+                    "predicted": f"{r['reading']:.2f}",
+                    "true_value": f"{r['true_value']:.2f}",
+                    "error": f"{err:.2f}",
+                    "tolerance": f"±{r['tolerance']:.2f}",
+                    "reason": f"Reading accepted but error {err:.2f} exceeds tolerance {r['tolerance']:.2f}",
+                })
+
+        # b) Harness or agent error
+        if r["status"] == "error":
+            failures.append({
+                "filename": r["filename"],
+                "category": f"Pipeline Error ({r['source']})",
+                "predicted": "None",
+                "true_value": f"{r['true_value']:.2f}" if r["true_value"] is not None else "N/A",
+                "error": "N/A",
+                "tolerance": f"±{r['tolerance']:.2f}",
+                "reason": r["error_message"] or "Internal pipeline exception",
+            })
+
+        # c) False rejection (expected read but rejected_input)
+        if r["expected_outcome"] == "read" and r["status"] == "rejected_input":
+            failures.append({
+                "filename": r["filename"],
+                "category": f"False Rejection ({r['source']})",
+                "predicted": "None",
+                "true_value": f"{r['true_value']:.2f}" if r["true_value"] is not None else "N/A",
+                "error": "N/A",
+                "tolerance": f"±{r['tolerance']:.2f}",
+                "reason": r["error_message"] or "Legitimate readable image was rejected",
+            })
+
+        # d) Missed escalation on obstructed image
+        if r["condition"] == "obstructed" and r["status"] == "accepted":
+            err_val = abs(r["reading"] - r["true_value"]) if (r["reading"] is not None and r["true_value"] is not None) else None
+            failures.append({
+                "filename": r["filename"],
+                "category": "Missed Escalation",
+                "predicted": f"{r['reading']:.2f}" if r["reading"] is not None else "None",
+                "true_value": f"{r['true_value']:.2f}" if r["true_value"] is not None else "N/A",
+                "error": f"{err_val:.2f}" if err_val is not None else "N/A",
+                "tolerance": f"±{r['tolerance']:.2f}",
+                "reason": "Obstructed image was accepted without human review",
+            })
+
+    if failures:
+        for f_item in failures:
+            lines.append(
+                f"| `{f_item['filename']}` | **{f_item['category']}** | {f_item['predicted']} | {f_item['true_value']} | {f_item['error']} | {f_item['tolerance']} | {f_item['reason']} |"
+            )
+    else:
+        lines.append("| *None* | - | - | - | - | - | No failure cases observed (0 failures) |")
+
+    lines.append("")
+    lines.append(sample_size_note)
+    lines.append("")
+
+    # --- 5) Latency & Environment Summary ---
+    lines.append("## 5. Latency & Environment Summary")
+    lines.append("")
+    latencies = [r["latency_ms"] for r in records if r["latency_ms"] is not None]
+
+    lines.append("### Latency Profile")
+    lines.append("")
+    lines.append("| Metric | Value | Note |")
+    lines.append("|:---|:---|:---|")
+    lines.append(f"| **Sample Count (n)** | {len(latencies)} | Total timed samples |")
+    if latencies:
+        mean_l = statistics.mean(latencies)
+        med_l = statistics.median(latencies)
+        sorted_l = sorted(latencies)
+        p95_idx = math.ceil(0.95 * len(sorted_l)) - 1
+        p95_l = sorted_l[max(0, p95_idx)]
+        min_l = min(latencies)
+        max_l = max(latencies)
+        p95_unreliable = len(latencies) < 20
+
+        lines.append(f"| **Mean Latency** | {mean_l:.1f} ms | Arithmetic average per sample |")
+        lines.append(f"| **Median Latency** | {med_l:.1f} ms | 50th percentile |")
+        lines.append(f"| **p95 Latency** | {p95_l:.1f} ms | 95th percentile {'*(unreliable: n < 20)*' if p95_unreliable else ''} |")
+        lines.append(f"| **Min Latency** | {min_l:.1f} ms | Fastest execution |")
+        lines.append(f"| **Max Latency** | {max_l:.1f} ms | Slowest execution |")
+    else:
+        lines.append("| **Latency** | N/A | No latency measurements recorded |")
+
+    lines.append("")
+    lines.append("### Execution Environment")
+    lines.append("")
+    lines.append("| Property | Recorded Value |")
+    lines.append("|:---|:---|")
+    lines.append(f"| **Compute Platform / OS** | `{env_data.get('platform', 'unknown')}` |")
+    python_ver_short = env_data.get("python_version", sys.version).splitlines()[0]
+    lines.append(f"| **Python Version** | `{python_ver_short}` |")
+    lines.append(f"| **OpenCV (`cv2`) Version** | `{env_data.get('cv2_version', 'unknown')}` |")
+    lines.append(f"| **NumPy Version** | `{env_data.get('numpy_version', 'unknown')}` |")
+    instance_type = env_data.get("EC2_INSTANCE_TYPE") or ("Local Workstation" if not env_data.get("GAUGEGUARD_RUN_LABEL") else env_data.get("GAUGEGUARD_RUN_LABEL"))
+    lines.append(f"| **Compute Instance Type** | `{instance_type}` |")
+    if env_data.get("GAUGEGUARD_RUN_LABEL"):
+        lines.append(f"| **Run Label** | `{env_data.get('GAUGEGUARD_RUN_LABEL')}` |")
+    warnings_list = env_data.get("warnings", [])
+    lines.append(f"| **Environment Warnings** | `{', '.join(warnings_list) if warnings_list else 'None'}` |")
+
+    lines.append("")
+    lines.append(sample_size_note)
+    lines.append("")
+
+    report_content = "\n".join(lines)
+    out_file = res_path / "report_tables.md"
+    out_file.write_text(report_content, encoding="utf-8")
+    return out_file
+
+
+def compare_runs(dir_a: str | Path, dir_b: str | Path) -> str:
+    """Generate a markdown comparison between two evaluation run directories (e.g. local vs EC2).
+
+    Warns if labelled sets differ or n < 20.
+    Ends each table with the sample size note.
+    """
+    path_a = Path(dir_a)
+    path_b = Path(dir_b)
+
+    rec_a_file = path_a / "records.csv"
+    rec_b_file = path_b / "records.csv"
+    env_a_file = path_a / "environment.json"
+    env_b_file = path_b / "environment.json"
+
+    if not rec_a_file.is_file():
+        raise FileNotFoundError(f"records.csv not found in {path_a}")
+    if not rec_b_file.is_file():
+        raise FileNotFoundError(f"records.csv not found in {path_b}")
+
+    def _read_records(fpath: Path) -> list[dict[str, Any]]:
+        recs = []
+        with open(fpath, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                recs.append({
+                    "filename": row["filename"],
+                    "status": row.get("status", "error"),
+                    "true_value": float(row["true_value"]) if row.get("true_value") not in ("", None) else None,
+                    "reading": float(row["reading"]) if row.get("reading") not in ("", None) else None,
+                    "tolerance": float(row["tolerance"]) if row.get("tolerance") not in ("", None) else 5.0,
+                    "latency_ms": float(row["latency_ms"]) if row.get("latency_ms") not in ("", None) else None,
+                })
+        return recs
+
+    recs_a = _read_records(rec_a_file)
+    recs_b = _read_records(rec_b_file)
+
+    env_a: dict[str, Any] = json.loads(env_a_file.read_text(encoding="utf-8")) if env_a_file.is_file() else {}
+    env_b: dict[str, Any] = json.loads(env_b_file.read_text(encoding="utf-8")) if env_b_file.is_file() else {}
+
+    n_a = len(recs_a)
+    n_b = len(recs_b)
+
+    files_a = {r["filename"] for r in recs_a}
+    files_b = {r["filename"] for r in recs_b}
+
+    lines: list[str] = [
+        f"# Comparison of Evaluation Runs: `{path_a.name}` vs `{path_b.name}`",
+        "",
+    ]
+
+    warnings: list[str] = []
+    if files_a != files_b:
+        warnings.append(
+            f"**Labelled sets differ**: Run A has {len(files_a)} images; Run B has {len(files_b)} images. "
+            f"({len(files_a ^ files_b)} discordant filenames). Comparisons may reflect different image sets."
+        )
+    if n_a < 20 or n_b < 20:
+        warnings.append(
+            f"**Small sample size**: n_A={n_a}, n_B={n_b} (n < 20). Latency percentiles and proportions are statistically noisy."
+        )
+
+    if warnings:
+        lines.append("> [!WARNING]")
+        for w in warnings:
+            lines.append(f"> - {w}")
+        lines.append("")
+
+    note_both = f"*Note: Sample size n_A = {n_a}, n_B = {n_b}. Results do not generalize beyond this gauge and these images.*"
+
+    # Table 1: Environment Comparison
+    lines.append("## 1. Environment Comparison")
+    lines.append("")
+    lines.append(f"| Property | Run A (`{path_a.name}`) | Run B (`{path_b.name}`) | Match? |")
+    lines.append("|:---|:---|:---|:---|")
+    inst_a = env_a.get("EC2_INSTANCE_TYPE") or env_a.get("GAUGEGUARD_RUN_LABEL") or "Local Workstation"
+    inst_b = env_b.get("EC2_INSTANCE_TYPE") or env_b.get("GAUGEGUARD_RUN_LABEL") or "Local Workstation"
+    lines.append(f"| **Compute Instance** | `{inst_a}` | `{inst_b}` | {'Yes' if inst_a == inst_b else 'No'} |")
+    lines.append(f"| **Platform** | `{env_a.get('platform', 'unknown')}` | `{env_b.get('platform', 'unknown')}` | {'Yes' if env_a.get('platform') == env_b.get('platform') else 'No'} |")
+    lines.append(f"| **OpenCV (`cv2`)** | `{env_a.get('cv2_version', 'unknown')}` | `{env_b.get('cv2_version', 'unknown')}` | {'Yes' if env_a.get('cv2_version') == env_b.get('cv2_version') else 'No'} |")
+    lines.append(f"| **NumPy** | `{env_a.get('numpy_version', 'unknown')}` | `{env_b.get('numpy_version', 'unknown')}` | {'Yes' if env_a.get('numpy_version') == env_b.get('numpy_version') else 'No'} |")
+    lines.append("")
+    lines.append(note_both)
+    lines.append("")
+
+    # Table 2: Latency Comparison
+    lat_a = [r["latency_ms"] for r in recs_a if r["latency_ms"] is not None]
+    lat_b = [r["latency_ms"] for r in recs_b if r["latency_ms"] is not None]
+
+    lines.append("## 2. Latency Comparison")
+    lines.append("")
+    lines.append(f"| Latency Metric | Run A (`{path_a.name}`) | Run B (`{path_b.name}`) | Delta (B - A) | Ratio (B / A) |")
+    lines.append("|:---|:---|:---|:---|:---|")
+
+    if lat_a and lat_b:
+        mean_a, mean_b = statistics.mean(lat_a), statistics.mean(lat_b)
+        med_a, med_b = statistics.median(lat_a), statistics.median(lat_b)
+        sorted_a = sorted(lat_a)
+        sorted_b = sorted(lat_b)
+        p95_a = sorted_a[max(0, math.ceil(0.95 * len(sorted_a)) - 1)]
+        p95_b = sorted_b[max(0, math.ceil(0.95 * len(sorted_b)) - 1)]
+
+        delta_mean = mean_b - mean_a
+        ratio_mean = mean_b / mean_a if mean_a > 0 else 1.0
+
+        delta_med = med_b - med_a
+        ratio_med = med_b / med_a if med_a > 0 else 1.0
+
+        delta_p95 = p95_b - p95_a
+        ratio_p95 = p95_b / p95_a if p95_a > 0 else 1.0
+
+        lines.append(f"| **Mean** | {mean_a:.1f} ms | {mean_b:.1f} ms | {delta_mean:+.1f} ms | {ratio_mean:.2f}x |")
+        lines.append(f"| **Median** | {med_a:.1f} ms | {med_b:.1f} ms | {delta_med:+.1f} ms | {ratio_med:.2f}x |")
+        lines.append(f"| **p95** | {p95_a:.1f} ms | {p95_b:.1f} ms | {delta_p95:+.1f} ms | {ratio_p95:.2f}x |")
+    else:
+        lines.append("| Latency | Insufficient data | Insufficient data | - | - |")
+
+    lines.append("")
+    lines.append(note_both)
+    lines.append("")
+
+    # Table 3: Accuracy & Coverage Comparison
+    lines.append("## 3. Accuracy & Coverage Comparison")
+    lines.append("")
+    lines.append(f"| Metric | Run A (`{path_a.name}`) | Run B (`{path_b.name}`) | Delta (B - A) |")
+    lines.append("|:---|:---|:---|:---|")
+
+    def _get_acc_stats(recs: list[dict[str, Any]]):
+        tot = len(recs)
+        ev = sum(1 for r in recs if r["status"] != "error")
+        acc = sum(1 for r in recs if r["status"] == "accepted")
+        truth = [r for r in recs if r["status"] == "accepted" and r["true_value"] is not None and r["reading"] is not None]
+        mae = statistics.mean(abs(r["reading"] - r["true_value"]) for r in truth) if truth else None
+        n_within = sum(1 for r in truth if abs(r["reading"] - r["true_value"]) <= r["tolerance"])
+        pct_within = (n_within / acc * 100.0) if acc > 0 else None
+        cov = (acc / ev * 100.0) if ev > 0 else None
+        return tot, ev, acc, cov, mae, pct_within
+
+    tot_a, ev_a, acc_a, cov_a, mae_a, within_a = _get_acc_stats(recs_a)
+    tot_b, ev_b, acc_b, cov_b, mae_b, within_b = _get_acc_stats(recs_b)
+
+    cov_str_a = f"{cov_a:.1f}% ({acc_a}/{ev_a})" if cov_a is not None else "N/A"
+    cov_str_b = f"{cov_b:.1f}% ({acc_b}/{ev_b})" if cov_b is not None else "N/A"
+    cov_delta = f"{(cov_b - cov_a):+.1f}%" if (cov_a is not None and cov_b is not None) else "N/A"
+
+    mae_str_a = f"{mae_a:.2f}" if mae_a is not None else "N/A"
+    mae_str_b = f"{mae_b:.2f}" if mae_b is not None else "N/A"
+    mae_delta = f"{(mae_b - mae_a):+.2f}" if (mae_a is not None and mae_b is not None) else "N/A"
+
+    within_str_a = f"{within_a:.1f}%" if within_a is not None else "N/A"
+    within_str_b = f"{within_b:.1f}%" if within_b is not None else "N/A"
+    within_delta = f"{(within_b - within_a):+.1f}%" if (within_a is not None and within_b is not None) else "N/A"
+
+    lines.append(f"| **Coverage** | {cov_str_a} | {cov_str_b} | {cov_delta} |")
+    lines.append(f"| **Mean Absolute Error (MAE)** | {mae_str_a} | {mae_str_b} | {mae_delta} |")
+    lines.append(f"| **Within-Tolerance Rate** | {within_str_a} | {within_str_b} | {within_delta} |")
+    lines.append("")
+    lines.append(note_both)
+    lines.append("")
+
+    return "\n".join(lines)
 
 
 # === Legacy Dataset Evaluation Models ===
@@ -1278,12 +1805,26 @@ def format_evaluation_report(metrics: EvaluationMetrics) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entrypoint for GaugeGuard evaluation pipeline."""
     parser = argparse.ArgumentParser(
-        description="GaugeGuard Evaluation Pipeline: evaluate pipeline on labelled data."
+        description="GaugeGuard Evaluation Pipeline: evaluate pipeline, report, and compare runs."
     )
     parser.add_argument(
         "--run",
         action="store_true",
         help="Run real pipeline evaluation on labelled dataset and write results.",
+    )
+    parser.add_argument(
+        "--report",
+        type=str,
+        default=None,
+        metavar="RESULTS_DIR",
+        help="Generate report_tables.md from an evaluation results directory.",
+    )
+    parser.add_argument(
+        "--compare",
+        nargs=2,
+        default=None,
+        metavar=("DIR_A", "DIR_B"),
+        help="Compare two evaluation run directories (e.g. local vs EC2).",
     )
     parser.add_argument(
         "--out",
@@ -1340,6 +1881,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.report:
+        report_path = make_report(args.report)
+        print(f"Report written to: {report_path}")
+        return 0
+
+    if args.compare:
+        dir_a, dir_b = args.compare
+        cmp_md = compare_runs(dir_a, dir_b)
+        print(cmp_md)
+        return 0
 
     # Resolve default paths
     if args.labels:
