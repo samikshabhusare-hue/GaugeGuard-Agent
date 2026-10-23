@@ -10,6 +10,8 @@ import argparse
 import csv
 import json
 import logging
+import math
+import statistics
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -326,6 +328,193 @@ def validate_labels_cli(csv_path: str | Path, images_dir: str | Path) -> int:
         print(f"Validation PASSED: {len(records)} labelled image(s), no issues")
 
     return 0
+
+
+# === Pure Metric Functions (no fabrication — return counts always) ===
+
+
+@dataclass(frozen=True)
+class EvalRecord:
+    """Per-evaluation record for pure metric computation.
+
+    Tolerance per record is computed at load time from profile.eval_tolerance_fraction
+    * profile scale and FIXED before running; tolerances must not be tuned after
+    seeing results.
+    """
+    filename: str
+    condition: str
+    expected_outcome: str  # "read" or "reject_input"
+    true_value: float | None
+    tolerance: float  # absolute, in value units — FIXED at load time
+    status: str  # "accepted" | "needs_human" | "rejected_input" | "error"
+    reading: float | None
+    retried: bool
+    attempts: int
+    latency_ms: float | None
+    first_pass_reading: float | None
+    error_message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# Helper for safe division with counts — never NaN, never 0 when denominator missing
+
+def _safe_rate(numerator: int, denominator: int) -> float | None:
+    """Rate = numerator / denominator; None if denominator == 0.
+    Always carries counts (numerator, denominator) in the returned dict.
+    """
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def compute_metrics(records: Sequence[EvalRecord]) -> dict[str, Any]:
+    """Compute pure metrics from EvalRecord list.
+
+    Denominator for incorrect_acceptance_rate = accepted (documented explicitly).
+    Zero denominator -> None (never 0 and never NaN). Every rate carries counts.
+    Sample sizes are small; always return counts.
+    """
+    recs = list(records)
+
+    n_total = len(recs)
+    n_evaluable = sum(1 for r in recs if r.status != "error")
+    n_accepted = sum(1 for r in recs if r.status == "accepted")
+    n_needs_human = sum(1 for r in recs if r.status == "needs_human")
+    n_errors = sum(1 for r in recs if r.status == "error")
+    n_rejected_input = sum(1 for r in recs if r.status == "rejected_input")
+
+    # Coverage = accepted / evaluable
+    coverage = _safe_rate(n_accepted, n_evaluable)
+
+    # MAE over accepted with true_value
+    accepted_with_truth = [
+        r for r in recs
+        if r.status == "accepted" and r.true_value is not None and r.reading is not None
+    ]
+    mae = None
+    if accepted_with_truth:
+        mae = statistics.mean(
+            abs(r.reading - r.true_value) for r in accepted_with_truth
+        )
+
+    # Within-tolerance rate = accepted & |err|<=tol / n_accepted
+    n_within_tolerance = sum(
+        1 for r in accepted_with_truth
+        if abs(r.reading - r.true_value) <= r.tolerance
+    )
+    within_tolerance_rate = _safe_rate(n_within_tolerance, n_accepted)
+
+    # Incorrect acceptance rate: denominator = accepted (documented)
+    n_incorrect = sum(
+        1 for r in accepted_with_truth
+        if abs(r.reading - r.true_value) > r.tolerance
+    )
+    incorrect_acceptance_rate = _safe_rate(n_incorrect, n_accepted)
+
+    # Retry / escalation rates over evaluable
+    n_retried = sum(1 for r in recs if r.retried)
+    retry_rate = _safe_rate(n_retried, n_evaluable)
+
+    escalation_rate = _safe_rate(n_needs_human, n_evaluable)
+
+    # Reject_input expectations reported separately
+    expected_reject = [r for r in recs if r.expected_outcome == "reject_input"]
+    correct_rejection_rate: float | None = None
+    if expected_reject:
+        correct_rejection_rate = _safe_rate(
+            sum(1 for r in expected_reject if r.status == "rejected_input"),
+            len(expected_reject)
+        )
+    false_rejection_count = sum(
+        1 for r in recs
+        if r.expected_outcome == "read" and r.status == "rejected_input"
+    )
+
+    # Latency summary
+    latencies = [r.latency_ms for r in recs if r.latency_ms is not None]
+    latency_summary: dict[str, Any] = {"n": len(latencies)}
+    if latencies:
+        latency_summary["mean"] = statistics.mean(latencies)
+        latency_summary["median"] = statistics.median(latencies)
+        # p95 via sorted list (small n OK)
+        sorted_lat = sorted(latencies)
+        idx_95 = math.ceil(0.95 * len(sorted_lat)) - 1
+        latency_summary["p95"] = sorted_lat[max(0, idx_95)]
+    if len(latencies) < 20:
+        latency_summary["p95_unreliable"] = True
+
+    # Note field for zero-denominator situations
+    notes: list[str] = []
+    if n_accepted == 0:
+        notes.append("n_accepted=0: within_tolerance_rate and incorrect_acceptance_rate undefined")
+    if n_evaluable == 0:
+        notes.append("n_evaluable=0: coverage, retry_rate, escalation_rate undefined")
+
+    return {
+        "n_total": n_total,
+        "n_evaluable": n_evaluable,
+        "n_accepted": n_accepted,
+        "n_needs_human": n_needs_human,
+        "n_errors": n_errors,
+        "n_rejected_input": n_rejected_input,
+        "coverage": (coverage, n_accepted, n_evaluable) if coverage is not None else (None, n_accepted, n_evaluable),
+        "mae": (mae, len(accepted_with_truth)) if mae is not None else (None, 0),
+        "within_tolerance_rate": (within_tolerance_rate, n_within_tolerance, n_accepted) if within_tolerance_rate is not None else (None, n_within_tolerance, n_accepted),
+        "incorrect_acceptance_rate": (incorrect_acceptance_rate, n_incorrect, n_accepted) if incorrect_acceptance_rate is not None else (None, n_incorrect, n_accepted),
+        "retry_rate": (retry_rate, n_retried, n_evaluable) if retry_rate is not None else (None, n_retried, n_evaluable),
+        "escalation_rate": (escalation_rate, n_needs_human, n_evaluable) if escalation_rate is not None else (None, n_needs_human, n_evaluable),
+        "correct_rejection_rate": (correct_rejection_rate, sum(1 for r in expected_reject if r.status == "rejected_input"), len(expected_reject)) if correct_rejection_rate is not None else (None, 0, len(expected_reject)),
+        "false_rejection_count": false_rejection_count,
+        "latency_summary": latency_summary,
+        "note": "; ".join(notes) if notes else "all denominators > 0",
+    }
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    """Wilson confidence interval for a proportion.
+
+    Args:
+        successes: Number of successes.
+        n: Total trials.
+        z: Z-score (default 1.96 ≈ 95%).
+
+    Returns:
+        (low, high) tuple, or None if n == 0.
+    """
+    if n == 0:
+        return None
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half_width = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
+    low = max(0.0, centre - half_width)
+    high = min(1.0, centre + half_width)
+    return (low, high)
+
+
+def metrics_by_condition(records: Sequence[EvalRecord]) -> dict[str, dict[str, Any]]:
+    """Group compute_metrics by condition."""
+    groups: dict[str, list[EvalRecord]] = {}
+    for r in records:
+        groups.setdefault(r.condition, []).append(r)
+    return {cond: compute_metrics(group) for cond, group in groups.items()}
+
+
+def latency_summary(values_ms: Sequence[float | None]) -> dict[str, Any]:
+    """Latency statistics with reliability flag for small samples."""
+    clean = [v for v in values_ms if v is not None]
+    result: dict[str, Any] = {"n": len(clean)}
+    if clean:
+        result["mean"] = statistics.mean(clean)
+        result["median"] = statistics.median(clean)
+        sorted_v = sorted(clean)
+        idx_95 = math.ceil(0.95 * len(sorted_v)) - 1
+        result["p95"] = sorted_v[max(0, idx_95)]
+    if len(clean) < 20:
+        result["p95_unreliable"] = True
+    return result
 
 
 def compute_mae(
