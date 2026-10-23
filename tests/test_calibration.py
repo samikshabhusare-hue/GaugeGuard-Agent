@@ -1364,3 +1364,91 @@ def test_agreement_result_to_dict_json_serializable():
     parsed = json.loads(json_str)
     assert parsed["agree"] is True
     assert parsed["difference"] == pytest.approx(1.0, abs=0.001)
+
+
+# === Fake Vision Integration & NumPy Type Leaks ===
+
+
+def test_fake_vision_output_to_calibration_to_json():
+    """Integration test: Fake vision output (with NumPy types) -> CalibrationResult -> to_dict -> json.dumps."""
+    import numpy as np
+    from gaugeguard.calibration import to_builtin
+
+    # Simulate fake vision detection output containing numpy scalar types
+    fake_detected_angle = np.float32(45.0)
+    fake_uncertainty = np.float64(2.5)
+
+    profile = get_profile("EXAMPLE_270")
+    cal_result = angle_to_value(fake_detected_angle, profile, angle_uncertainty_deg=fake_uncertainty)
+
+    assert cal_result.value is not None
+    assert cal_result.in_bounds is True
+
+    # Convert to dict
+    result_dict = cal_result.to_dict()
+
+    # Verify no numpy types leak into dict
+    assert type(result_dict["value"]) is float
+    assert type(result_dict["value_low"]) is float
+    assert type(result_dict["value_high"]) is float
+    assert isinstance(result_dict["flags"], list)
+    assert all(type(f) is str for f in result_dict["flags"])
+    assert isinstance(result_dict["in_bounds"], bool)
+
+    # Must be 100% JSON serializable
+    json_str = json.dumps(result_dict)
+    assert isinstance(json_str, str)
+    round_trip = json.loads(json_str)
+    assert round_trip["value"] == pytest.approx(result_dict["value"], abs=1e-4)
+
+
+def test_fake_vision_coordinates_to_calibration_to_json():
+    """Integration test: Fake vision pixel coordinates (NumPy floats) -> pixel_to_angle_deg -> CalibrationResult -> to_dict -> json.dumps."""
+    import numpy as np
+
+    center = (np.float32(100.0), np.float32(100.0))
+    tip = (np.float32(100.0), np.float32(50.0))  # 12 o'clock (0 degrees)
+
+    angle = pixel_to_angle_deg(center, tip)
+    assert type(angle) is float
+    assert angle == pytest.approx(0.0, abs=1e-4)
+
+    profile = get_profile("EXAMPLE_270")
+    cal_result = angle_to_value(angle, profile)
+    d = cal_result.to_dict()
+
+    json_str = json.dumps(d)
+    assert isinstance(json_str, str)
+    parsed = json.loads(json_str)
+    assert parsed["value"] == pytest.approx(50.0, abs=1e-3)
+
+
+def test_to_builtin_nested_numpy_structures():
+    """Ensure to_builtin converts arbitrarily nested numpy scalars and arrays to pure Python types."""
+    import numpy as np
+    from gaugeguard.calibration import to_builtin
+
+    nested = {
+        "scalar_f32": np.float32(3.14),
+        "scalar_i64": np.int64(42),
+        "scalar_bool": np.bool_(True),
+        "array_1d": np.array([np.float32(1.1), np.float32(2.2)]),
+        "matrix": np.zeros((2, 2), dtype=np.uint8),
+        "nested_list": [{"val": np.float64(9.99)}],
+    }
+
+    clean = to_builtin(nested)
+
+    # Validate all types
+    assert type(clean["scalar_f32"]) is float
+    assert type(clean["scalar_i64"]) is int
+    assert type(clean["scalar_bool"]) is bool
+    assert isinstance(clean["array_1d"], list)
+    assert all(type(x) is float for x in clean["array_1d"])
+    assert isinstance(clean["matrix"], list)
+    assert all(isinstance(row, list) for row in clean["matrix"])
+    assert type(clean["nested_list"][0]["val"]) is float
+
+    # Must be JSON-serializable
+    serialized = json.dumps(clean)
+    assert isinstance(serialized, str)

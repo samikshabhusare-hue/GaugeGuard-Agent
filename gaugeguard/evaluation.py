@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
-from gaugeguard.calibration import GaugeProfile, UnknownProfileError, get_profile
+from gaugeguard.calibration import GaugeProfile, UnknownProfileError, get_profile, to_builtin
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ class LabelRecord:
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return to_builtin(asdict(self))
 
 
 VALID_CONDITIONS = {"clear", "blurry", "tilted", "dark", "obstructed", "other"}
@@ -357,71 +357,192 @@ def validate_labels_cli(csv_path: str | Path, images_dir: str | Path) -> int:
 def run_pipeline(
     image_bgr: Any,
     profile: GaugeProfile | None = None,
+    pipeline_fn: Any = None,
 ) -> dict[str, Any]:
     """Adapter coupling evaluation harness to the real agent.py interface.
 
-    Adapts agent.inspect_upload to return a normalized dict:
+    Adapts agent.inspect_upload (or a custom pipeline_fn) to return a normalized dict:
     {status, reading, retried, attempts, first_pass_reading, action_log, reason}
+    Guarantees that all values are native Python types and JSON-serializable.
     """
-    import cv2
-    from gaugeguard.agent import inspect_upload
-    from gaugeguard.calibration import angle_to_value, get_profile
+    from gaugeguard.calibration import angle_to_value, get_profile, to_builtin
 
     if profile is None:
         profile = get_profile("EXAMPLE_270")
 
-    if isinstance(image_bgr, bytes):
+    if isinstance(image_bgr, (str, Path)):
+        with open(image_bgr, "rb") as f:
+            image_bytes = f.read()
+    elif isinstance(image_bgr, bytes):
         image_bytes = image_bgr
     else:
+        import cv2
         success, encoded = cv2.imencode(".png", image_bgr)
         if not success:
             raise ValueError("Failed to encode image to PNG bytes for agent pipeline")
         image_bytes = encoded.tobytes()
 
-    inspection = inspect_upload(image_bytes, profile=profile)
+    if pipeline_fn is not None:
+        try:
+            inspection = pipeline_fn(image_bytes, profile=profile)
+        except TypeError:
+            inspection = pipeline_fn(image_bgr, profile=profile)
+    else:
+        from gaugeguard.agent import inspect_upload
+        try:
+            inspection = inspect_upload(image_bytes, profile=profile)
+        except ValueError as exc:
+            return to_builtin({
+                "status": "rejected_input",
+                "reading": None,
+                "retried": False,
+                "attempts": 0,
+                "first_pass_reading": None,
+                "action_log": [{"step_name": "decode_image", "error": str(exc)}],
+                "reason": str(exc),
+            })
+        except Exception as exc:
+            return to_builtin({
+                "status": "error",
+                "reading": None,
+                "retried": False,
+                "attempts": 0,
+                "first_pass_reading": None,
+                "action_log": [{"step_name": "inspect_upload", "error": str(exc)}],
+                "reason": str(exc),
+            })
 
-    # Extract first-pass reading
+    # 1. Extract status, reading, and reason
+    status = "error"
+    reading = None
+    reason = ""
+
+    reading_obj = getattr(inspection, "reading", None)
+    if reading_obj is not None:
+        if hasattr(reading_obj, "status"):
+            status = str(reading_obj.status)
+        elif isinstance(reading_obj, dict):
+            status = str(reading_obj.get("status", "error"))
+
+        if hasattr(reading_obj, "value"):
+            reading = reading_obj.value
+        elif isinstance(reading_obj, dict):
+            reading = reading_obj.get("value")
+        elif isinstance(reading_obj, (int, float)):
+            reading = reading_obj
+
+        if hasattr(reading_obj, "reason"):
+            reason = str(reading_obj.reason or "")
+        elif isinstance(reading_obj, dict):
+            reason = str(reading_obj.get("reason", ""))
+    elif isinstance(inspection, dict):
+        status = str(inspection.get("status", "error"))
+        reading = inspection.get("reading")
+        reason = str(inspection.get("reason", ""))
+
+    # If inspection explicitly flagged needs_human, ensure status reflects escalation
+    if getattr(inspection, "needs_human", False) and status == "accepted":
+        status = "needs_human"
+
+    # 2. Extract attempts
+    attempts_raw = getattr(inspection, "attempts", None)
+    if attempts_raw is None and isinstance(inspection, dict):
+        attempts_raw = inspection.get("attempts")
+
+    # 3. Extract action log
+    action_log_raw = getattr(inspection, "action_log", None)
+    if action_log_raw is None and isinstance(inspection, dict):
+        action_log_raw = inspection.get("action_log")
+    if not isinstance(action_log_raw, list):
+        action_log_raw = []
+
+    # 4. Determine retried & attempts count
+    if isinstance(attempts_raw, int):
+        num_attempts = attempts_raw
+        retried = num_attempts > 1
+    elif isinstance(attempts_raw, (list, tuple)):
+        num_attempts = max(1, len(attempts_raw))
+        retried = len(attempts_raw) > 1
+    else:
+        num_attempts = 1
+        retried = False
+
+    retry_steps = [
+        s for s in action_log_raw
+        if (getattr(s, "step_name", None) or (s.get("step_name") if isinstance(s, dict) else "")).startswith("retry_")
+    ]
+    if retry_steps:
+        retried = True
+        num_attempts = max(num_attempts, 1 + len(retry_steps))
+
+    # 5. Extract first_pass_reading
     first_pass_reading = None
-    if inspection.attempts:
-        first_attempt = inspection.attempts[0]
-        angle_deg = first_attempt.get("angle_deg")
-        if angle_deg is not None:
-            cal = angle_to_value(angle_deg, profile)
-            first_pass_reading = cal.value
-    elif inspection.action_log:
-        for step in inspection.action_log:
-            if getattr(step, "step_name", None) == "initial_detection":
-                out = getattr(step, "output_summary", {})
-                ang = out.get("angle_degrees")
-                if ang is not None:
-                    cal = angle_to_value(ang, profile)
-                    first_pass_reading = cal.value
+
+    # Priority A: Check if action_log contains reading_comparison with initial_value
+    for step in action_log_raw:
+        s_name = getattr(step, "step_name", None) or (step.get("step_name") if isinstance(step, dict) else None)
+        out = getattr(step, "output_summary", None) or (step.get("output_summary") if isinstance(step, dict) else None)
+        if s_name == "reading_comparison" and isinstance(out, dict) and "initial_value" in out:
+            first_pass_reading = out["initial_value"]
+            break
+
+    # Priority B: Check first attempt in attempts_raw
+    if first_pass_reading is None and isinstance(attempts_raw, (list, tuple)) and attempts_raw:
+        first_att = attempts_raw[0]
+        if isinstance(first_att, dict):
+            if first_att.get("reading") is not None:
+                first_pass_reading = first_att["reading"]
+            elif first_att.get("value") is not None:
+                first_pass_reading = first_att["value"]
+            elif first_att.get("angle_deg") is not None:
+                cal = angle_to_value(first_att["angle_deg"], profile)
+                first_pass_reading = cal.value
+            elif first_att.get("angle_degrees") is not None:
+                cal = angle_to_value(first_att["angle_degrees"], profile)
+                first_pass_reading = cal.value
+
+    # Priority C: Check initial_detection step in action_log
+    if first_pass_reading is None:
+        for step in action_log_raw:
+            s_name = getattr(step, "step_name", None) or (step.get("step_name") if isinstance(step, dict) else None)
+            if s_name == "initial_detection":
+                out = getattr(step, "output_summary", None) or (step.get("output_summary") if isinstance(step, dict) else None)
+                if isinstance(out, dict):
+                    ang = out.get("angle_degrees") if out.get("angle_degrees") is not None else out.get("angle_deg")
+                    if ang is not None:
+                        cal = angle_to_value(ang, profile)
+                        first_pass_reading = cal.value
+                    elif out.get("value") is not None:
+                        first_pass_reading = out["value"]
+                    elif out.get("reading") is not None:
+                        first_pass_reading = out["reading"]
                 break
 
-    if first_pass_reading is None and len(inspection.attempts) <= 1:
-        first_pass_reading = inspection.reading.value
+    # Priority D: If not retried or only 1 attempt, fallback to final reading
+    if first_pass_reading is None and not retried:
+        first_pass_reading = reading
 
-    # Format action log to list of dicts
+    # 6. Format action log into list of dicts
     action_log_dicts: list[dict[str, Any]] = []
-    for step in inspection.action_log:
-        if hasattr(step, "to_dict"):
-            action_log_dicts.append(step.to_dict())
+    for step in action_log_raw:
+        if hasattr(step, "to_dict") and callable(step.to_dict):
+            action_log_dicts.append(to_builtin(step.to_dict()))
         elif hasattr(step, "__dataclass_fields__"):
-            action_log_dicts.append(asdict(step))
+            action_log_dicts.append(to_builtin(asdict(step)))
         elif isinstance(step, dict):
-            action_log_dicts.append(step)
+            action_log_dicts.append(to_builtin(step))
         else:
             action_log_dicts.append({"step_name": str(step)})
 
-    return {
-        "status": inspection.reading.status,
-        "reading": inspection.reading.value,
-        "retried": len(inspection.attempts) > 1,
-        "attempts": max(1, len(inspection.attempts)),
+    return to_builtin({
+        "status": status,
+        "reading": reading,
+        "retried": retried,
+        "attempts": num_attempts,
         "first_pass_reading": first_pass_reading,
         "action_log": action_log_dicts,
-        "reason": inspection.reading.reason or "",
-    }
+        "reason": reason,
+    })
 
 
 class StubPipeline:
@@ -507,7 +628,7 @@ def capture_environment() -> dict[str, Any]:
     if warnings:
         env_info["warnings"] = warnings
 
-    return env_info
+    return to_builtin(env_info)
 
 
 # === Pure Metric Functions ===
@@ -531,7 +652,7 @@ class EvalRecord:
     source: str = "agent"
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return to_builtin(asdict(self))
 
 
 def _safe_rate(numerator: int, denominator: int) -> float | None:
@@ -610,7 +731,7 @@ def compute_metrics(records: Sequence[EvalRecord]) -> dict[str, Any]:
     if n_evaluable == 0:
         notes.append("n_evaluable=0: coverage, retry_rate, escalation_rate undefined")
 
-    return {
+    return to_builtin({
         "n_total": n_total,
         "n_evaluable": n_evaluable,
         "n_accepted": n_accepted,
@@ -627,7 +748,7 @@ def compute_metrics(records: Sequence[EvalRecord]) -> dict[str, Any]:
         "false_rejection_count": false_rejection_count,
         "latency_summary": latency_summary_dict,
         "note": "; ".join(notes) if notes else "all denominators > 0",
-    }
+    })
 
 
 def compute_baseline_metrics(records: Sequence[EvalRecord]) -> dict[str, Any] | str:
@@ -1451,7 +1572,7 @@ class EvaluationRecord:
     action_log_summary: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return to_builtin(asdict(self))
 
 
 @dataclass
@@ -1483,7 +1604,10 @@ class EvaluationMetrics:
     def to_summary_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d.pop("records", None)
-        return d
+        return to_builtin(d)
+
+    def to_dict(self) -> dict[str, Any]:
+        return to_builtin(asdict(self))
 
 
 def load_labels_csv(csv_path: str | Path) -> list[dict[str, Any]]:

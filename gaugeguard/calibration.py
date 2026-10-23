@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 
 # === Exceptions ===
@@ -18,9 +19,70 @@ class UnknownProfileError(CalibrationError):
 # === Utilities ===
 
 
-def _is_finite(value: float) -> bool:
+def _is_finite(value: Any) -> bool:
     """Check if a value is finite (not NaN, not infinity)."""
-    return value == value and abs(value) != float("inf")
+    try:
+        f = float(value)
+        return math.isfinite(f)
+    except (TypeError, ValueError):
+        return False
+
+
+# === Streamlit-safe JSON helper ===
+
+
+def to_builtin(obj: Any) -> Any:
+    """Convert numpy scalars / arrays and custom objects to plain Python types.
+
+    Safe to call repeatedly from a Streamlit rerun;
+    maintains no global mutable state, never writes files, and never imports cv2.
+    """
+    if obj is None:
+        return None
+
+    # Handle numpy arrays or objects with tolist()
+    if hasattr(obj, "tolist") and callable(obj.tolist):
+        return to_builtin(obj.tolist())
+
+    # Handle numpy scalars or objects with .item()
+    if hasattr(obj, "item") and callable(obj.item):
+        try:
+            return to_builtin(obj.item())
+        except (TypeError, ValueError):
+            pass
+
+    # Handle mapping
+    if isinstance(obj, dict):
+        return {
+            str(k) if not isinstance(k, (str, int, float, bool)) else to_builtin(k): to_builtin(v)
+            for k, v in obj.items()
+        }
+
+    # Handle sequences
+    if isinstance(obj, (list, tuple, set)):
+        return [to_builtin(v) for v in obj]
+
+    # Handle custom objects with to_dict
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return to_builtin(obj.to_dict())
+
+    # Handle dataclass instances (not classes)
+    if hasattr(obj, "__dataclass_fields__") and not isinstance(obj, type):
+        import dataclasses
+        return to_builtin(dataclasses.asdict(obj))
+
+    # Standard primitive types
+    if isinstance(obj, (bool, str, int, float)):
+        return obj
+
+    # Fallback for numbers.Number types
+    import numbers
+    if isinstance(obj, numbers.Integral):
+        return int(obj)
+    if isinstance(obj, numbers.Real):
+        return float(obj)
+
+    return obj
 
 
 # === GaugeProfile ===
@@ -45,6 +107,23 @@ class GaugeProfile:
     operating_max: float | None = None
     agreement_tolerance_fraction: float = 0.02
     eval_tolerance_fraction: float = 0.05
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return JSON-serializable dict (only built-in types)."""
+        return to_builtin({
+            "name": self.name,
+            "unit": self.unit,
+            "minimum_value": self.minimum_value,
+            "maximum_value": self.maximum_value,
+            "minimum_angle_degrees": self.minimum_angle_degrees,
+            "maximum_angle_degrees": self.maximum_angle_degrees,
+            "direction": self.direction,
+            "bounds_margin_deg": self.bounds_margin_deg,
+            "operating_min": self.operating_min,
+            "operating_max": self.operating_max,
+            "agreement_tolerance_fraction": self.agreement_tolerance_fraction,
+            "eval_tolerance_fraction": self.eval_tolerance_fraction,
+        })
 
 
 # === Profile Validation ===
@@ -218,7 +297,7 @@ class CalibrationResult:
 
     def to_dict(self) -> dict:
         """Return JSON-serializable dict (only built-in types)."""
-        return {
+        return to_builtin({
             "value": self.value,
             "unit": self.unit,
             "in_bounds": self.in_bounds,
@@ -228,7 +307,7 @@ class CalibrationResult:
             "value_high": self.value_high,
             "flags": list(self.flags),
             "reason": self.reason,
-        }
+        })
 
 
 # === Angle Utilities ===
@@ -255,9 +334,22 @@ def normalize_angle_deg(angle: float) -> float:
         >>> normalize_angle_deg(725.0)
         5.0
     """
-    # Type check
+    # Type check (disallow bool)
+    if isinstance(angle, bool):
+        raise TypeError("Angle must be a number, got bool")
+
+    if hasattr(angle, "item") and callable(angle.item):
+        try:
+            angle = angle.item()
+        except (TypeError, ValueError):
+            pass
+
     if not isinstance(angle, (int, float)):
-        raise TypeError(f"Angle must be a number, got {type(angle).__name__}")
+        import numbers
+        if isinstance(angle, numbers.Real):
+            angle = float(angle)
+        else:
+            raise TypeError(f"Angle must be a number, got {type(angle).__name__}")
 
     # Finite check
     if not _is_finite(angle):
@@ -344,7 +436,18 @@ def angle_to_value(
             reason="Angle is None; cannot compute reading.",
         )
 
-    if not isinstance(angle_deg, (int, float)):
+    if not isinstance(angle_deg, bool):
+        if hasattr(angle_deg, "item") and callable(angle_deg.item):
+            try:
+                angle_deg = angle_deg.item()
+            except (TypeError, ValueError):
+                pass
+        if not isinstance(angle_deg, (int, float)):
+            import numbers
+            if isinstance(angle_deg, numbers.Real):
+                angle_deg = float(angle_deg)
+
+    if isinstance(angle_deg, bool) or not isinstance(angle_deg, (int, float)):
         return CalibrationResult(
             value=None,
             unit=profile.unit,
@@ -396,15 +499,24 @@ def angle_to_value(
         value_high_calc = None
         if angle_uncertainty_deg is not None:
             # Validate uncertainty
-            if not isinstance(angle_uncertainty_deg, (int, float)) or not _is_finite(angle_uncertainty_deg):
-                result_flags.append("invalid_uncertainty")
-            elif angle_uncertainty_deg < 0:
+            unc = angle_uncertainty_deg
+            if not isinstance(unc, bool) and hasattr(unc, "item") and callable(unc.item):
+                try:
+                    unc = unc.item()
+                except (TypeError, ValueError):
+                    pass
+            if not isinstance(unc, bool) and not isinstance(unc, (int, float)):
+                import numbers
+                if isinstance(unc, numbers.Real):
+                    unc = float(unc)
+            if isinstance(unc, bool) or not isinstance(unc, (int, float)) or not _is_finite(unc) or unc < 0:
                 result_flags.append("invalid_uncertainty")
             else:
+                unc_float = float(unc)
                 # Propagate angle uncertainty through linear calibration
                 # value_delta = (angle_uncertainty_deg / sweep) * (max_value - min_value)
                 value_range = profile.maximum_value - profile.minimum_value
-                value_delta = (angle_uncertainty_deg / sweep) * value_range
+                value_delta = (unc_float / sweep) * value_range
 
                 value_low_calc = value - value_delta
                 value_high_calc = value + value_delta
@@ -514,12 +626,12 @@ class AgreementResult:
 
     def to_dict(self) -> dict:
         """Return JSON-serializable dict (only built-in types)."""
-        return {
+        return to_builtin({
             "agree": self.agree,
             "difference": self.difference,
             "tolerance": self.tolerance,
             "reason": self.reason,
-        }
+        })
 
 
 def readings_agree(
@@ -552,6 +664,29 @@ def readings_agree(
         - The tolerance fraction must be confirmed by the team based on
           empirical measurement uncertainty from labeled gauge images.
     """
+    # Convert numpy scalars if present
+    if a is not None and not isinstance(a, bool):
+        if hasattr(a, "item") and callable(a.item):
+            try:
+                a = a.item()
+            except (TypeError, ValueError):
+                pass
+        if not isinstance(a, (int, float)):
+            import numbers
+            if isinstance(a, numbers.Real):
+                a = float(a)
+
+    if b is not None and not isinstance(b, bool):
+        if hasattr(b, "item") and callable(b.item):
+            try:
+                b = b.item()
+            except (TypeError, ValueError):
+                pass
+        if not isinstance(b, (int, float)):
+            import numbers
+            if isinstance(b, numbers.Real):
+                b = float(b)
+
     # Compute tolerance threshold
     value_range = profile.maximum_value - profile.minimum_value
     tolerance = profile.agreement_tolerance_fraction * value_range
@@ -573,14 +708,14 @@ def readings_agree(
         )
 
     # Check for non-numeric inputs
-    if not isinstance(a, (int, float)):
+    if isinstance(a, bool) or not isinstance(a, (int, float)):
         return AgreementResult(
             agree=False,
             difference=None,
             tolerance=tolerance,
             reason=f"First reading must be a number, got {type(a).__name__}.",
         )
-    if not isinstance(b, (int, float)):
+    if isinstance(b, bool) or not isinstance(b, (int, float)):
         return AgreementResult(
             agree=False,
             difference=None,
@@ -650,10 +785,26 @@ def pixel_to_angle_deg(center_xy: tuple[float, float], point_xy: tuple[float, fl
     cx, cy = center_xy
     x, y = point_xy
 
-    # Check for finite numbers
-    if not all(isinstance(v, (int, float)) and _is_finite(v) for v in (cx, cy, x, y)):
-        raise ValueError("All coordinates must be finite numbers")
+    clean_coords = []
+    for v in (cx, cy, x, y):
+        if isinstance(v, bool):
+            raise ValueError("All coordinates must be finite numbers")
+        if hasattr(v, "item") and callable(v.item):
+            try:
+                v = v.item()
+            except (TypeError, ValueError):
+                pass
+        if not isinstance(v, (int, float)):
+            import numbers
+            if isinstance(v, numbers.Real):
+                v = float(v)
+            else:
+                raise ValueError("All coordinates must be finite numbers")
+        if not _is_finite(v):
+            raise ValueError("All coordinates must be finite numbers")
+        clean_coords.append(float(v))
 
+    cx, cy, x, y = clean_coords
     dx = x - cx
     dy = y - cy
 
@@ -667,6 +818,7 @@ def pixel_to_angle_deg(center_xy: tuple[float, float], point_xy: tuple[float, fl
 
     # Normalize to [0, 360)
     return normalize_angle_deg(angle_deg)
+
 
 def profile_from_tick_points(
     name: str,
@@ -713,50 +865,6 @@ def profile_from_tick_points(
 
     return profile
 
-# === Profile Registry ===
-
-# Example profile for testing - NOT a real gauge model.
-# Tolerance values are placeholders pending actual gauge characterization.
-_EXAMPLE_PROFILE = GaugeProfile(
-    name="EXAMPLE_270",
-    unit="units",
-    minimum_value=0.0,
-    maximum_value=100.0,
-    minimum_angle_degrees=225.0,  # 7:30 position
-    maximum_angle_degrees=135.0,  # 4:30 position (270° sweep clockwise)
-    direction="cw",
-    bounds_margin_deg=5.0,
-    operating_min=10.0,
-    operating_max=90.0,
-    agreement_tolerance_fraction=0.02,  # placeholder: 2% of scale
-    eval_tolerance_fraction=0.05,  # placeholder: 5% of scale
-)
-
-PROFILES: dict[str, GaugeProfile] = {
-    "EXAMPLE_270": _EXAMPLE_PROFILE,
-}
-
-# Validate all registered profiles at module load
-for _profile in PROFILES.values():
-    validate_profile(_profile)
-
-def get_profile(name: str) -> GaugeProfile:
-    """Retrieve a registered gauge profile by name.
-
-    Args:
-        name: Profile identifier.
-
-    Returns:
-        The requested GaugeProfile.
-
-    Raises:
-        UnknownProfileError: Profile name not registered.
-    """
-    if name not in PROFILES:
-        raise UnknownProfileError(
-            f"Profile '{name}' not found. Available profiles: {', '.join(PROFILES.keys())}"
-        )
-    return PROFILES[name]
 
 def describe_profile(profile: GaugeProfile) -> str:
     """Generate a report-ready summary of a gauge profile.
@@ -787,3 +895,4 @@ def describe_profile(profile: GaugeProfile) -> str:
         f"Eval tolerance: {profile.eval_tolerance_fraction * 100:.1f}% of scale\n"
         f"Assumptions: Linear scale, clockwise, measured from {image_ref}\n"
     )
+

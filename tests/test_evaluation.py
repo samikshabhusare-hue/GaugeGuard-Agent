@@ -753,3 +753,223 @@ def test_cli_report_and_compare(tmp_path: Path, capsys):
     captured = capsys.readouterr()
     assert "Comparison of Evaluation Runs" in captured.out
 
+
+# === Real Agent Result Shape & Pipeline Adapter Tests ===
+
+
+def test_run_pipeline_adapts_real_agent_result_shape_accepted():
+    """Verify run_pipeline correctly adapts a real agent InspectionResult with NumPy types."""
+    import numpy as np
+    from gaugeguard.calibration import get_profile
+    from gaugeguard.models import AgentStep, ImageQuality, InspectionResult, ReadingEstimate
+
+    profile = get_profile("EXAMPLE_270")
+
+    def fake_agent(img_bytes: bytes, profile=None):
+        return InspectionResult(
+            reading=ReadingEstimate(
+                value=np.float32(50.0),
+                unit=profile.unit if profile else "units",
+                angle_degrees=np.float32(0.0),
+                confidence=np.float32(0.95),
+                status="accepted",
+                reason="Reading accepted within profile bounds.",
+            ),
+            quality=ImageQuality(
+                width=640,
+                height=480,
+                blur_score=np.float64(82.4),
+                contrast_score=np.float64(45.1),
+                flags=(),
+            ),
+            action_log=[
+                AgentStep(
+                    step_name="image_quality",
+                    method="opencv_laplacian_and_contrast",
+                    reason="Pre-flight quality check",
+                    output_summary={"blur_score": np.float64(82.4), "contrast_score": np.float64(45.1)},
+                ),
+                AgentStep(
+                    step_name="initial_detection",
+                    method="detect_dial_and_needle_default",
+                    reason="Initial pass",
+                    output_summary={
+                        "attempt": 1,
+                        "angle_degrees": np.float32(0.0),
+                        "confidence": np.float32(0.95),
+                        "flags": [],
+                    },
+                ),
+            ],
+            annotated_image=np.zeros((100, 100, 3), dtype=np.uint8),
+            needs_human=False,
+            attempts=[
+                {
+                    "attempt": 1,
+                    "method": "default",
+                    "success": True,
+                    "angle_deg": np.float32(0.0),
+                    "confidence": np.float32(0.95),
+                    "flags": [],
+                }
+            ],
+        )
+
+    out = run_pipeline(b"fake_image_bytes", profile=profile, pipeline_fn=fake_agent)
+
+    # Check normalized structure
+    assert out["status"] == "accepted"
+    assert out["reading"] == pytest.approx(50.0, abs=1e-3)
+    assert out["retried"] is False
+    assert out["attempts"] == 1
+    assert out["first_pass_reading"] == pytest.approx(50.0, abs=1e-3)
+    assert len(out["action_log"]) == 2
+    assert "Reading accepted" in out["reason"]
+
+    # Verify no numpy types leak
+    assert type(out["reading"]) is float
+    assert type(out["first_pass_reading"]) is float
+    assert type(out["retried"]) is bool
+    assert type(out["attempts"]) is int
+    assert type(out["action_log"][0]["output_summary"]["blur_score"]) is float
+
+    # Verify JSON serializability
+    json_str = json.dumps(out)
+    assert isinstance(json_str, str)
+    roundtrip = json.loads(json_str)
+    assert roundtrip["reading"] == 50.0
+
+
+def test_run_pipeline_adapts_real_agent_result_shape_retry_and_escalate():
+    """Verify run_pipeline correctly extracts first_pass_reading and retry state on escalated agent result."""
+    import numpy as np
+    from gaugeguard.calibration import get_profile
+    from gaugeguard.models import AgentStep, ImageQuality, InspectionResult, ReadingEstimate
+
+    profile = get_profile("EXAMPLE_270")
+
+    def fake_retry_agent(img_bytes: bytes, profile=None):
+        return InspectionResult(
+            reading=ReadingEstimate(
+                value=None,
+                unit=profile.unit if profile else "units",
+                angle_degrees=None,
+                confidence=np.float32(0.40),
+                status="needs_human",
+                reason="Readings disagree: initial 20.0 != retry 45.0",
+            ),
+            quality=ImageQuality(
+                width=640,
+                height=480,
+                blur_score=np.float64(30.0),
+                contrast_score=np.float64(20.0),
+                flags=("low_contrast",),
+            ),
+            action_log=[
+                AgentStep(
+                    step_name="initial_detection",
+                    method="detect_default",
+                    reason="Pass 1",
+                    output_summary={"angle_degrees": np.float32(270.0)},
+                ),
+                AgentStep(
+                    step_name="retry_clahe",
+                    method="preprocess_clahe",
+                    reason="Retry with CLAHE",
+                    output_summary={"angle_degrees": np.float32(0.0)},
+                ),
+                AgentStep(
+                    step_name="reading_comparison",
+                    method="readings_agree",
+                    reason="Compare pass 1 and pass 2",
+                    output_summary={
+                        "initial_value": np.float32(16.67),
+                        "retry_value": np.float32(50.0),
+                        "agree": False,
+                    },
+                ),
+            ],
+            annotated_image=np.zeros((50, 50, 3), dtype=np.uint8),
+            needs_human=True,
+            attempts=[
+                {"attempt": 1, "method": "default", "angle_deg": np.float32(270.0), "confidence": 0.5},
+                {"attempt": 2, "method": "clahe", "angle_deg": np.float32(0.0), "confidence": 0.6},
+            ],
+        )
+
+    out = run_pipeline(b"fake_bytes", profile=profile, pipeline_fn=fake_retry_agent)
+
+    assert out["status"] == "needs_human"
+    assert out["reading"] is None
+    assert out["retried"] is True
+    assert out["attempts"] == 2
+    assert out["first_pass_reading"] == pytest.approx(16.67, abs=1e-2)
+    assert type(out["first_pass_reading"]) is float
+
+    # JSON serializability
+    json_str = json.dumps(out)
+    assert isinstance(json_str, str)
+
+
+def test_evaluation_with_real_agent_shaped_pipeline(tmp_path: Path):
+    """Verify run_evaluation end-to-end using a pipeline returning real-agent InspectionResults."""
+    import numpy as np
+    from gaugeguard.calibration import get_profile
+    from gaugeguard.evaluation import run_evaluation
+    from gaugeguard.models import AgentStep, ImageQuality, InspectionResult, ReadingEstimate
+
+    profile = get_profile("EXAMPLE_270")
+
+    # Create dummy image and labels.csv
+    import cv2
+    img_file = tmp_path / "test1.png"
+    cv2.imwrite(str(img_file), np.zeros((100, 100, 3), dtype=np.uint8))
+
+    csv_file = tmp_path / "labels.csv"
+    csv_file.write_text(
+        "filename,gauge_profile,true_value,label_uncertainty,unit,condition,expected_outcome,label_source,notes\n"
+        "test1.png,EXAMPLE_270,50.0,2.5,units,clear,read,manual,\n",
+        encoding="utf-8",
+    )
+
+    def pipeline_adapter(img_bgr, profile=None):
+        def fake_agent(img_bytes, profile=None):
+            return InspectionResult(
+                reading=ReadingEstimate(
+                    value=np.float32(50.0),
+                    unit="units",
+                    angle_degrees=np.float32(0.0),
+                    confidence=np.float32(0.90),
+                    status="accepted",
+                    reason="verified",
+                ),
+                quality=ImageQuality(
+                    width=320,
+                    height=240,
+                    blur_score=np.float64(75.0),
+                    contrast_score=np.float64(35.0),
+                ),
+                action_log=[
+                    AgentStep("initial_detection", "default", "ok", {"angle_degrees": np.float32(0.0)})
+                ],
+                needs_human=False,
+                attempts=[{"attempt": 1, "angle_deg": np.float32(0.0)}],
+            )
+        return run_pipeline(img_bgr, profile=profile, pipeline_fn=fake_agent)
+
+    records, details = run_evaluation(
+        csv_file,
+        tmp_path,
+        pipeline=pipeline_adapter,
+    )
+
+    assert len(records) == 1
+    rec = records[0]
+    assert rec.status == "accepted"
+    assert rec.reading == 50.0
+    assert type(rec.reading) is float
+    d = rec.to_dict()
+    # Verify JSON serialization works without error
+    json_str = json.dumps(d)
+    assert isinstance(json_str, str)
+
