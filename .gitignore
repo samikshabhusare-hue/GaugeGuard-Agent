@@ -18,3 +18,4 @@ outputs/
 data/private/
 data/raw/
 .aws/
+.venv310/
