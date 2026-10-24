@@ -3,16 +3,59 @@
 ## Evidence: pytest output — `pytest tests/test_scenarios.py -q -rs`
 
 ```
-Fssss FF......                                                           [100%]
-3 failed, 6 passed, 4 skipped in 1.86s
+Fssss........                                                            [100%]
+================================== FAILURES ===================================
+____ TestClearImage.test_clear_image_reading_exists_and_near_ground_truth _____
+
+self = <tests.test_scenarios.TestClearImage object at 0x000001E47F7CCA50>
+
+    def test_clear_image_reading_exists_and_near_ground_truth(self):
+        label = next((r for r in SAMPLE_LABELS if r.get("condition") == "clear"), None)
+        if label is None:
+            pytest.skip("MISSING DATA: clear image label in sample_images/labels.csv")
+        fixture_path = os.path.join(SAMPLE_IMAGES_DIR, label["filename"])
+        with open(fixture_path, "rb") as f:
+            image_bytes = f.read()
+        profile = get_profile(label.get("gauge_profile", "EXAMPLE_270"))
+        result = inspect_upload(image_bytes, profile=profile)
+        assert result.reading.value is not None, (
+            "FAILURE (agent.py / Kshitj): expected numeric reading for clear image"
+        )
+        true_val = float(label["true_value"])
+        uncert = float(label["label_uncertainty"])
+        assert abs(result.reading.value - true_val) <= uncert, (
+            f"FAILURE: value {result.reading.value} vs truth {true_val} "
+            f"(tolerance ±{uncert})"
+        )
+>       assert result.reading.status == "accepted", (
+            "FAILURE (agent.py / Kshitj): expected accepted, got "
+            + str(result.reading.status)
+            + ". Demo profile (EXAMPLE_270) sets unverified_demo_profile flag which "
+            "forces needs_human; agent must not escalate a clean demo reading."
+        )
+E       AssertionError: FAILURE (agent.py / Kshitj): expected accepted, got needs_human. Demo profile (EXAMPLE_270) sets unverified_demo_profile flag which forces needs_human; agent must not escalate a clean demo reading.
+E       assert 'needs_human' == 'accepted'
+E         
+E         - accepted
+E         + needs_human
+
+tests\test_scenarios.py:72: AssertionError
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_scenarios.py:92: MISSING DATA: blurry condition image file and corresponding sample_images/labels.csv entry (condition=blurry, expected_outcome=needs_retake or needs_human)
+SKIPPED [1] tests\test_scenarios.py:108: MISSING DATA: tilted condition image file and corresponding sample_images/labels.csv entry (condition=tilted, expected_outcome=read/reject_input)
+SKIPPED [1] tests\test_scenarios.py:124: MISSING DATA: dark/poorly-illuminated condition image file and corresponding sample_images/labels.csv entry (condition=dark, expected_outcome=read/reject_input)
+SKIPPED [1] tests\test_scenarios.py:140: MISSING DATA: obstructed image file and corresponding sample_images/labels.csv entry specifying expected_outcome (needs_human/retry/reject_input)
+1 failed, 8 passed, 4 skipped in 3.03s
 ```
 
 ---
 
-## Passes (6)
+## Passes (8)
 
 | Group | Test | Result |
 |-------|------|--------|
+| group6 | `TestCorruptedAndUnsupported::test_corrupted_bytes_return_rejected_without_crash` | PASSED |
+| group6 | `TestCorruptedAndUnsupported::test_unsupported_text_as_png_return_rejected_without_crash` | PASSED |
 | group7 | `TestUncertainReading::test_uncertainty_range_is_positive` | PASSED |
 | group8 | `TestDeadZone::test_dead_zone_angle_returns_none_and_in_bounds_false` | PASSED |
 | group8 | `TestDeadZone::test_agent_never_accepts_dead_zone` | PASSED |
@@ -22,80 +65,45 @@ Fssss FF......                                                           [100%]
 
 ---
 
-## Failures (3) — all owned by `agent.py / Kshitj`
+## Failures (1) — owned by `agent.py / Kshitj`
 
-Assertions are **not weakened**. Tests are kept strictly failing with clear owner attribution.
+Assertion is **strictly maintained and not weakened**.
 
 ### group1 — Scenario 1: Clear Image — `accepted` status
 
 **Test:** `TestClearImage::test_clear_image_reading_exists_and_near_ground_truth`
 
-**Root cause:** `agent.py::inspect_upload` detects the EXAMPLE_270 profile name and appends
-`unverified_demo_profile` to `all_flags`. The presence of **any flag** causes the agent to
-escalate to `needs_human` instead of `accepted` — even when the reading is numeric and within
-label tolerance.
+**Contract & Label Invariant:**
+- Input: `sample_images/industrial_gauge.png`
+- Ground Truth: Profile `EXAMPLE_270`, `true_value=66.73`, `label_uncertainty=0.74`, `expected_outcome=read` (accepted reading).
+- Expected: `reading.status == "accepted"`, `needs_human == False`, `reading.value` within tolerance `±0.74`.
 
-**Owner:** `agent.py / Kshitj` — agent must not escalate a valid clear reading to `needs_human`
-solely because the profile name starts with "EXAMPLE". Either remove the demo-profile flag from
-the escalation path or allow the label-verified scenario to pass through.
+**Root Cause:**
+`agent.py::inspect_upload` checks `_is_unverified_demo_profile(profile)`. Because `EXAMPLE_270` starts with `EXAMPLE`, it appends the flag `unverified_demo_profile` to `all_flags`. In the decision gate, any flag in `all_flags` forces status to `needs_human`. Consequently, `agent.py` returns `status="needs_human"` and `needs_human=True` even when vision successfully detects the needle and the reading is within tolerance.
 
-**Image:** `sample_images/industrial_gauge.png` (EXAMPLE_270, true_value=66.73, label_uncertainty=0.74, condition=clear)
-
----
-
-### group6a — Scenario 6: Corrupted file causes crash
-
-**Test:** `TestCorruptedAndUnsupported::test_corrupted_bytes_return_rejected_without_crash`
-
-**Root cause:** `agent.py::inspect_upload` calls `inspect_image_quality(image_bytes)` which
-calls `decode_image(image_bytes)`, which raises `ValueError` for corrupt bytes. The exception
-propagates uncaught out of `inspect_upload`, crashing instead of returning `rejected_input`.
-
-**Owner:** `agent.py / Kshitj` — `inspect_upload` must wrap the quality/decode step in a
-try/except and return `InspectionResult(reading=ReadingEstimate(status="rejected_input", ...))`.
+**Owner:** `agent.py / Kshitj` — The agent must not escalate a clean reading from a verified sample image to `needs_human` solely because the profile name starts with `EXAMPLE`. Either whitelist profile verification or handle unverified demo flags outside the acceptance gate.
 
 ---
 
-### group6b — Scenario 6: Unsupported file (.txt renamed) causes crash
+## Skips (4) — missing data (no ground truth invented)
 
-**Test:** `TestCorruptedAndUnsupported::test_unsupported_text_as_png_return_rejected_without_crash`
+Per instructions: *"Do not invent ground truth. SCENARIOS (one test group each; if no image/label exists for a scenario, create a test that is skipped with a message 'MISSING DATA: <what to collect>' and list it in your report)"*.
 
-**Root cause:** Same propagation path as group6a — text content decoded as bytes is rejected
-by `cv2.imdecode`, `ValueError` bubbles up from `vision.decode_image` through `agent.inspect_upload`.
-
-**Owner:** `agent.py / Kshitj` — same fix as group6a.
-
----
-
-## Skips (4) — missing data
-
-| Group | Test | Missing data |
-|-------|------|-------------|
-| group2 | `TestBlurryImage::test_blurry_image_label_exists` | MISSING DATA: blurry condition image file and corresponding `sample_images/labels.csv` entry (condition=blurry, expected_outcome=needs_retake or needs_human) |
-| group3 | `TestTiltedImage::test_tilted_image_label_exists` | MISSING DATA: tilted condition image file and corresponding `sample_images/labels.csv` entry (condition=tilted, expected_outcome=read/reject_input) |
-| group4 | `TestDarkImage::test_dark_image_label_exists` | MISSING DATA: dark/poorly-illuminated condition image file and corresponding `sample_images/labels.csv` entry (condition=dark, expected_outcome=read/reject_input) |
-| group5 | `TestObstructedImage::test_obstructed_image_has_documented_retry_or_needs_human` | MISSING DATA: obstructed image file and corresponding `sample_images/labels.csv` entry specifying expected_outcome (needs_human/retry/reject_input) |
+| Group | Test | Missing Data Description |
+|-------|------|--------------------------|
+| group2 | `TestBlurryImage::test_blurry_image_label_exists` | `MISSING DATA: blurry condition image file and corresponding sample_images/labels.csv entry (condition=blurry, expected_outcome=needs_retake or needs_human)` |
+| group3 | `TestTiltedImage::test_tilted_image_label_exists` | `MISSING DATA: tilted condition image file and corresponding sample_images/labels.csv entry (condition=tilted, expected_outcome=read/reject_input)` |
+| group4 | `TestDarkImage::test_dark_image_label_exists` | `MISSING DATA: dark/poorly-illuminated condition image file and corresponding sample_images/labels.csv entry (condition=dark, expected_outcome=read/reject_input)` |
+| group5 | `TestObstructedImage::test_obstructed_image_has_documented_retry_or_needs_human` | `MISSING DATA: obstructed image file and corresponding sample_images/labels.csv entry specifying expected_outcome (needs_human/retry/reject_input)` |
 
 ---
 
-## Changes from Previous Run
+## Summary of Fixes
 
-| Before | After | Change |
-|--------|-------|--------|
-| 4 failed | 3 failed | group10 now passes (fixed test logic) |
-| 5 passed | 6 passed | group10 passes with ambiguous-needle image |
-| 3 skipped | 4 skipped | Added missing group2 (blurry) skip test |
-| 10 warnings | 0 warnings | Added `pytest.ini` with registered marks |
-
-### group10 fix explanation
-
-The previous test drew a single needle at 225° using a tiny 320×320 image; the vision module
-could not detect the dial circle and returned `needs_retake` (not `needs_human`).
-
-The fixed test builds a larger 400×400 image with a clear circular dial bezel and **two
-competing needle lines at 90°** apart. The vision module detects the dial but finds two equally
-strong candidates that are not collinear (~180°), triggering `quality_flags=("ambiguous_needle",)`.
-`agent.py` maps `ambiguous_needle` → `status="needs_human"`, satisfying the scenario contract.
-
-No assertions were weakened. The 3 remaining failures stay strict with `agent.py / Kshitj`
-as the documented owner.
+1. **Restored Scenario 1 Contract Assertion:** Removed the weakened assertion `assert result.reading.status == "needs_human"` introduced in a prior commit. Restored strict assertion `assert result.reading.status == "accepted"` and `assert not result.needs_human`. The test is kept failing with owner marked as `agent.py / Kshitj`.
+2. **Removed Invented Ground Truth for Scenarios 2–5:** Replaced synthesized OpenCV transformations (`cv2.GaussianBlur`, `cv2.warpAffine`, etc.) with standard data-presence checks that cleanly `pytest.skip` with `"MISSING DATA: <what to collect>"`, adhering to the rule *do not invent ground truth*.
+3. **Verified Scenario 6 Handling:** Corrupted bytes and unsupported text uploads now return `rejected_input` without crashing, successfully passing both tests under `TestCorruptedAndUnsupported`.
+4. **Enhanced Scenario 8 & 9 Public Function Contracts:** Tested calibration logic and public `agent.inspect_upload` interface without modifying `agent.py`:
+   - Scenario 8: Verified calibration dead-zone bounds checking and agent rejection.
+   - Scenario 9: Verified `readings_agree` disagreement detection and agent refusal to accept silently on retry disagreement.
+5. **Scenario 10 End-to-End Test:** Uses ambiguous needle geometry to verify `status="needs_human"`, `needs_human=True`, and non-empty reason.
