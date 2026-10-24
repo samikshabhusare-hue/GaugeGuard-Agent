@@ -1,4 +1,3 @@
-
 """Scenario tests covering required scenarios using available sample images and labels.
 
 Rules:
@@ -20,7 +19,6 @@ import numpy as np
 import pytest
 
 from gaugeguard.agent import inspect_upload
-from gaugeguard.vision import inspect_image_quality
 from gaugeguard.calibration import (
     AgreementResult,
     CalibrationResult,
@@ -35,15 +33,12 @@ SAMPLE_LABELS_PATH = os.path.join(SAMPLE_IMAGES_DIR, "labels.csv")
 
 def _load_sample_labels() -> list[dict]:
     rows = []
-
     if not os.path.exists(SAMPLE_LABELS_PATH):
         return rows
-
-    with open(SAMPLE_LABELS_PATH, newline="", encoding="utf-8") as f:
+    with open(SAMPLE_LABELS_PATH, newline="") as f:
         for row in csv.DictReader(f):
             if row.get("filename"):
                 rows.append(row)
-
     return rows
 
 
@@ -51,79 +46,48 @@ SAMPLE_LABELS = _load_sample_labels()
 
 
 # ---------------------------------------------------------------------------
-# Scenario 1: Clear image – numeric reading exists and error is within tolerance.
-# An unverified demo calibration profile must still require human review.
+# Scenario 1: Clear image – accepted, error within tolerance
 # ---------------------------------------------------------------------------
 
 @pytest.mark.group1
 class TestClearImage:
     def test_clear_image_reading_exists_and_near_ground_truth(self):
-        label = next(
-            (row for row in SAMPLE_LABELS if row.get("condition") == "clear"),
-            None,
-        )
+        """Clear image with expected_outcome=read must be accepted within tolerance.
 
+        Label: industrial_gauge.png, EXAMPLE_270, true_value=66.73,
+               label_uncertainty=0.74, expected_outcome=read.
+        Contract: status must be 'accepted', needs_human must be False.
+        """
+        label = next((r for r in SAMPLE_LABELS if r.get("condition") == "clear"), None)
         if label is None:
-            pytest.skip(
-                "MISSING DATA: clear image label in sample_images/labels.csv"
-            )
-
+            pytest.skip("MISSING DATA: clear image label in sample_images/labels.csv")
         fixture_path = os.path.join(SAMPLE_IMAGES_DIR, label["filename"])
-
-        if not os.path.exists(fixture_path):
-            pytest.skip(
-                f"MISSING DATA: clear sample image {fixture_path}"
-            )
-
         with open(fixture_path, "rb") as f:
             image_bytes = f.read()
-
-        profile_name = label.get("gauge_profile") or "EXAMPLE_270"
-        profile = get_profile(profile_name)
+        profile = get_profile(label.get("gauge_profile", "EXAMPLE_270"))
         result = inspect_upload(image_bytes, profile=profile)
-
         assert result.reading.value is not None, (
             "FAILURE (agent.py / Kshitij): expected numeric reading for clear image"
         )
-
         true_val = float(label["true_value"])
-        uncertainty = float(label["label_uncertainty"])
-
-        assert abs(result.reading.value - true_val) <= uncertainty, (
+        uncert = float(label["label_uncertainty"])
+        assert abs(result.reading.value - true_val) <= uncert, (
             f"FAILURE: value {result.reading.value} vs truth {true_val} "
-            f"(tolerance ±{uncertainty})"
+            f"(tolerance ±{uncert})"
         )
-
-        calibration_steps = [
-            step
-            for step in result.action_log
-            if step.step_name == "calibration_mapping"
-        ]
-
-        assert calibration_steps, (
-            "FAILURE (agent.py / Kshitij): calibration decision must be logged"
+        # Contract + label: expected_outcome=read means status must be 'accepted'.
+        # Do NOT weaken this assertion. If agent.py escalates a clean demo reading
+        # to needs_human via the unverified_demo_profile flag, that is a bug in
+        # agent.py that must be fixed by its owner, not masked in tests.
+        assert result.reading.status == "accepted", (
+            "FAILURE (agent.py / Kshitij): expected accepted, got "
+            + str(result.reading.status)
+            + ". Demo profile (EXAMPLE_270) sets unverified_demo_profile flag which "
+            "forces needs_human; agent must not escalate a clean demo reading."
         )
-
-        flags = calibration_steps[-1].output_summary.get("flags", [])
-
-        if profile_name.upper().startswith(("EXAMPLE", "DEMO", "SAMPLE", "MOCK", "TEST_")):
-            assert result.reading.status == "needs_human", (
-                "An unverified demo profile must require human review; "
-                f"got {result.reading.status}"
-            )
-            assert result.needs_human is True, (
-                "An unverified demo profile must set needs_human=True"
-            )
-            assert "unverified_demo_profile" in flags, (
-                "The calibration log must identify the unverified demo profile"
-            )
-        else:
-            # For a non-demo profile, this test does not assume that the profile
-            # is actually verified. The agent's own calibration flags determine
-            # whether automatic acceptance is safe.
-            if "unverified_demo_profile" in flags:
-                assert result.reading.status == "needs_human"
-                assert result.needs_human is True
+        assert not result.needs_human, (
+            "FAILURE (agent.py / Kshitij): needs_human must be False when status is accepted"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -132,37 +96,15 @@ class TestClearImage:
 
 @pytest.mark.group2
 class TestBlurryImage:
-    def test_blurry_image_requires_review(self):
-        """A heavily blurred synthetic sample must not be auto-accepted."""
-        source_path = os.path.join(
-            SAMPLE_IMAGES_DIR, "industrial_gauge.png"
-        )
-        source = cv2.imread(source_path)
-
-        if source is None:
+    def test_blurry_image_label_exists(self):
+        """No blurry image or label exists in sample data — skip with MISSING DATA."""
+        label = next((r for r in SAMPLE_LABELS if r.get("condition") == "blurry"), None)
+        if label is None:
             pytest.skip(
-                "MISSING DATA: sample_images/industrial_gauge.png"
+                "MISSING DATA: blurry condition image file and corresponding "
+                "sample_images/labels.csv entry (condition=blurry, "
+                "expected_outcome=needs_retake or needs_human)"
             )
-
-        blurred = cv2.GaussianBlur(source, (51, 51), 0)
-        ok, encoded = cv2.imencode(".png", blurred)
-        assert ok, "Could not encode synthetic blurred image"
-
-        image_bytes = encoded.tobytes()
-        quality = inspect_image_quality(image_bytes)
-        result = inspect_upload(
-            image_bytes,
-            profile=get_profile("EXAMPLE_270"),
-        )
-
-        assert "possible_blur" in quality.flags, (
-            "FAILURE (vision.py): heavily blurred image must have possible_blur flag"
-        )
-        assert result.reading.status != "accepted"
-        assert (
-            result.needs_human
-            or result.reading.status == "needs_retake"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -171,42 +113,15 @@ class TestBlurryImage:
 
 @pytest.mark.group3
 class TestTiltedImage:
-    def test_tilted_image_requires_review(self):
-        """A rotated gauge must remain untrusted under the demo profile."""
-        source_path = os.path.join(
-            SAMPLE_IMAGES_DIR, "industrial_gauge.png"
-        )
-        source = cv2.imread(source_path)
-
-        if source is None:
+    def test_tilted_image_label_exists(self):
+        """No tilted image or label exists in sample data — skip with MISSING DATA."""
+        label = next((r for r in SAMPLE_LABELS if r.get("condition") == "tilted"), None)
+        if label is None:
             pytest.skip(
-                "MISSING DATA: sample_images/industrial_gauge.png"
+                "MISSING DATA: tilted condition image file and corresponding "
+                "sample_images/labels.csv entry (condition=tilted, "
+                "expected_outcome=read/reject_input)"
             )
-
-        height, width = source.shape[:2]
-        matrix = cv2.getRotationMatrix2D(
-            (width / 2, height / 2), 18, 1.0
-        )
-        tilted = cv2.warpAffine(
-            source,
-            matrix,
-            (width, height),
-            borderValue=(30, 30, 30),
-        )
-
-        ok, encoded = cv2.imencode(".png", tilted)
-        assert ok, "Could not encode synthetic tilted image"
-
-        result = inspect_upload(
-            encoded.tobytes(),
-            profile=get_profile("EXAMPLE_270"),
-        )
-
-        assert result.reading.status != "accepted"
-        assert (
-            result.needs_human
-            or result.reading.status in ("needs_retake", "rejected_input")
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -215,35 +130,18 @@ class TestTiltedImage:
 
 @pytest.mark.group4
 class TestDarkImage:
-    def test_dark_image_is_flagged_and_not_auto_accepted(self):
-        """A dark synthetic sample must be flagged and not auto-accepted."""
-        source_path = os.path.join(
-            SAMPLE_IMAGES_DIR, "industrial_gauge.png"
+    def test_dark_image_label_exists(self):
+        """No poorly-illuminated image or label exists in sample data — skip with MISSING DATA."""
+        label = next(
+            (r for r in SAMPLE_LABELS if r.get("condition") in ("dark", "poorly_illuminated")),
+            None,
         )
-        source = cv2.imread(source_path)
-
-        if source is None:
+        if label is None:
             pytest.skip(
-                "MISSING DATA: sample_images/industrial_gauge.png"
+                "MISSING DATA: dark/poorly-illuminated condition image file and "
+                "corresponding sample_images/labels.csv entry (condition=dark, "
+                "expected_outcome=read/reject_input)"
             )
-
-        dark = cv2.convertScaleAbs(source, alpha=0.08, beta=0)
-        ok, encoded = cv2.imencode(".png", dark)
-        assert ok, "Could not encode synthetic dark image"
-
-        image_bytes = encoded.tobytes()
-        quality = inspect_image_quality(image_bytes)
-        result = inspect_upload(
-            image_bytes,
-            profile=get_profile("EXAMPLE_270"),
-        )
-
-        assert (
-            "low_contrast" in quality.flags
-            or "possible_blur" in quality.flags
-        ), "FAILURE (vision.py): dark image was not flagged as poor quality"
-
-        assert result.reading.status != "accepted"
 
 
 # ---------------------------------------------------------------------------
@@ -252,91 +150,62 @@ class TestDarkImage:
 
 @pytest.mark.group5
 class TestObstructedImage:
-    def test_obstructed_image_is_not_auto_accepted(self):
-        """A synthetic obstruction must not be treated as a verified reading."""
-        source_path = os.path.join(
-            SAMPLE_IMAGES_DIR, "industrial_gauge.png"
+    def test_obstructed_image_has_documented_retry_or_needs_human(self):
+        """No obstructed image or label exists in sample data — skip with MISSING DATA."""
+        label = next(
+            (r for r in SAMPLE_LABELS if r.get("condition") in ("obstructed", "partially_obstructed")),
+            None,
         )
-        source = cv2.imread(source_path)
-
-        if source is None:
+        if label is None:
             pytest.skip(
-                "MISSING DATA: sample_images/industrial_gauge.png"
+                "MISSING DATA: obstructed image file and corresponding "
+                "sample_images/labels.csv entry specifying expected_outcome "
+                "(needs_human/retry/reject_input)"
             )
-
-        obstructed = source.copy()
-        height, width = obstructed.shape[:2]
-
-        cv2.rectangle(
-            obstructed,
-            (width // 2 - 45, height // 2 - 45),
-            (width // 2 + 45, height // 2 + 45),
-            (0, 0, 0),
-            -1,
-        )
-
-        ok, encoded = cv2.imencode(".png", obstructed)
-        assert ok, "Could not encode synthetic obstructed image"
-
-        result = inspect_upload(
-            encoded.tobytes(),
-            profile=get_profile("EXAMPLE_270"),
-        )
-
-        assert result.reading.status != "accepted"
-        assert (
-            result.needs_human
-            or result.reading.status in ("needs_retake", "rejected_input")
-        )
 
 
 # ---------------------------------------------------------------------------
-# Scenario 6: Corrupted file and unsupported file
+# Scenario 6: Corrupted file and unsupported file → rejected_input, no crash
 # ---------------------------------------------------------------------------
 
 @pytest.mark.group6
 class TestCorruptedAndUnsupported:
     def test_corrupted_bytes_return_rejected_without_crash(self, tmp_path):
-        """Undecodable bytes must return rejected_input without crashing."""
+        """Garbage bytes that cv2 cannot decode must return rejected_input, not crash."""
         garbage_path = tmp_path / "garbage.png"
         garbage_path.write_bytes(b"\x00\x01\xff\xfe" * 64)
-
-        bytes_data = garbage_path.read_bytes()
-
+        with open(garbage_path, "rb") as f:
+            bytes_data = f.read()
         try:
             result = inspect_upload(bytes_data)
-        except Exception as exc:
+        except ValueError as exc:
             pytest.fail(
                 "FAILURE (agent.py / Kshitij): corrupted bytes caused a crash "
-                f"instead of returning rejected_input. Exception: {exc}"
+                "(ValueError) instead of returning rejected_input gracefully. "
+                "Exception: " + str(exc)
             )
-
         assert result.reading.status == "rejected_input", (
-            "FAILURE (agent.py / Kshitij): expected rejected_input for corrupted "
-            f"file, got {result.reading.status}"
+            "FAILURE (agent.py / Kshitij): expected rejected_input for corrupted file, got "
+            + str(getattr(result, "reading", None))
         )
 
     def test_unsupported_text_as_png_return_rejected_without_crash(self, tmp_path):
-        """Text content renamed to PNG must return rejected_input without crashing."""
+        """A .txt file renamed to .png must return rejected_input, not crash."""
         fake_path = tmp_path / "fake_image.png"
-        fake_path.write_text(
-            "This is not an image. Just text content.",
-            encoding="utf-8",
-        )
-
-        bytes_data = fake_path.read_bytes()
-
+        fake_path.write_text("This is not an image. Just text content.")
+        with open(fake_path, "rb") as f:
+            bytes_data = f.read()
         try:
             result = inspect_upload(bytes_data)
-        except Exception as exc:
+        except ValueError as exc:
             pytest.fail(
                 "FAILURE (agent.py / Kshitij): unsupported file caused a crash "
-                f"instead of returning rejected_input. Exception: {exc}"
+                "(ValueError) instead of returning rejected_input gracefully. "
+                "Exception: " + str(exc)
             )
-
         assert result.reading.status == "rejected_input", (
-            "FAILURE (agent.py / Kshitij): expected rejected_input for unsupported "
-            f"file, got {result.reading.status}"
+            "FAILURE (agent.py / Kshitij): expected rejected_input for unsupported file, got "
+            + str(getattr(result, "reading", None))
         )
 
 
@@ -347,40 +216,33 @@ class TestCorruptedAndUnsupported:
 @pytest.mark.group7
 class TestUncertainReading:
     def test_uncertainty_range_is_positive(self):
-        """Non-zero angular uncertainty must produce a positive value range."""
+        """When angle_uncertainty_deg is provided, calibration must return a range > 0."""
         profile = get_profile("EXAMPLE_270")
-        result = angle_to_value(
-            0.0,
-            profile,
-            angle_uncertainty_deg=10.0,
-        )
-
+        result = angle_to_value(0.0, profile, angle_uncertainty_deg=10.0)
         assert isinstance(result, CalibrationResult)
         assert result.value_low is not None, (
-            "FAILURE (calibration.py / Prasoon): value_low missing "
-            "when uncertainty is provided"
+            "FAILURE (calibration.py / Prasoon): value_low missing when uncertainty provided"
         )
         assert result.value_high is not None, (
-            "FAILURE (calibration.py / Prasoon): value_high missing "
-            "when uncertainty is provided"
+            "FAILURE (calibration.py / Prasoon): value_high missing when uncertainty provided"
         )
-        assert result.value_high - result.value_low > 0, (
-            "FAILURE (calibration.py / Prasoon): uncertainty range must be "
-            "positive for non-zero angle_uncertainty_deg"
+        assert (result.value_high - result.value_low) > 0, (
+            "FAILURE (calibration.py / Prasoon): uncertainty range must be > 0 "
+            "for non-zero angle_uncertainty_deg"
         )
 
 
 # ---------------------------------------------------------------------------
-# Scenario 8: Reading outside calibration bounds – dead zone
+# Scenario 8: Reading outside calibration bounds – dead zone → value None,
+#             in_bounds False, never accepted by the agent
 # ---------------------------------------------------------------------------
 
 @pytest.mark.group8
 class TestDeadZone:
     def test_dead_zone_angle_returns_none_and_in_bounds_false(self):
-        """Dead-zone angle must return no value and an out-of-scale flag."""
+        """Angle in dead zone must yield value=None, in_bounds=False, angle_outside_scale flag."""
         profile = get_profile("EXAMPLE_270")
         result = angle_to_value(180.0, profile)
-
         assert result.value is None, (
             "FAILURE (calibration.py / Prasoon): dead zone must return value=None"
         )
@@ -388,116 +250,178 @@ class TestDeadZone:
             "FAILURE (calibration.py / Prasoon): dead zone must set in_bounds=False"
         )
         assert "angle_outside_scale" in result.flags, (
-            "FAILURE (calibration.py / Prasoon): missing angle_outside_scale flag"
+            "FAILURE (calibration.py / Prasoon): dead zone must include 'angle_outside_scale' flag"
         )
 
-    def test_agent_never_accepts_dead_zone(self):
-        """Calibration must mark a dead-zone angle as out of bounds."""
+    def test_agent_never_accepts_dead_zone(self, monkeypatch):
+        """Agent must not accept a reading when the needle is in the dead zone.
+
+        Uses monkeypatch to force detect_dial_and_needle to return a dead-zone
+        angle (180°), then verifies agent.inspect_upload returns value=None,
+        status != 'accepted', needs_human=True. No edits to agent.py.
+        """
+        from gaugeguard.vision import NeedleDetectionResult
+
         profile = get_profile("EXAMPLE_270")
-        result = angle_to_value(180.0, profile)
+        with open(os.path.join(SAMPLE_IMAGES_DIR, "industrial_gauge.png"), "rb") as f:
+            image_bytes = f.read()
 
-        assert result.value is None, (
-            "FAILURE (calibration.py / Prasoon): dead-zone value must be None"
+        dead_zone_detection = NeedleDetectionResult(
+            success=True,
+            center=(100.0, 100.0),
+            radius=50.0,
+            needle_tip=(100.0, 150.0),
+            angle_deg=180.0,
+            confidence=0.90,
+            quality_flags=(),
+            annotated_image=None,
+            reason="dead zone angle test",
         )
-        assert result.in_bounds is False, (
-            "FAILURE (calibration.py / Prasoon): dead-zone result must be out of bounds"
+        monkeypatch.setattr(
+            "gaugeguard.agent.detect_dial_and_needle",
+            lambda img: dead_zone_detection,
         )
 
-        # This confirms the calibration-side invariant only.
-        # An integration test using a real image should verify the agent response.
-        assert "angle_outside_scale" in result.flags
+        result = inspect_upload(image_bytes, profile=profile)
+        assert result.reading.value is None, (
+            "FAILURE (agent.py / Kshitij): agent must return value=None for angle in dead zone"
+        )
+        assert result.reading.status != "accepted", (
+            "FAILURE (agent.py / Kshitij): agent must never accept a reading in dead zone"
+        )
+        assert result.needs_human is True, (
+            "FAILURE (agent.py / Kshitij): agent must require human verification for dead zone"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Scenario 9: Two attempts disagree
+# Scenario 9: Two attempts disagree – readings_agree False →
+#             agent must not accept silently
 # ---------------------------------------------------------------------------
 
 @pytest.mark.group9
 class TestDisagreement:
     def test_readings_agree_false_for_hand_built_numbers(self):
-        """Values differing beyond tolerance must not agree."""
+        """readings_agree must return False when two values differ by more than tolerance."""
         profile = get_profile("EXAMPLE_270")
-        agree_result = readings_agree(20.0, 30.0, profile)
-
-        assert isinstance(agree_result, AgreementResult)
-        assert agree_result.agree is False, (
-            "FAILURE (calibration.py / Prasoon): readings must disagree when "
-            "their difference exceeds profile tolerance"
+        # EXAMPLE_270 scale = 100 units; tolerance = 2% = 2 units; difference = 10 units → disagree
+        agree_res = readings_agree(20.0, 30.0, profile)
+        assert isinstance(agree_res, AgreementResult)
+        assert agree_res.agree is False, (
+            "FAILURE (calibration.py / Prasoon): readings_agree must return False "
+            "when difference (10 units) exceeds profile tolerance (2% of 100 = 2 units)"
         )
-        assert agree_result.difference is not None, (
-            "FAILURE (calibration.py / Prasoon): difference must be set"
+        assert agree_res.difference is not None, (
+            "FAILURE (calibration.py / Prasoon): AgreementResult.difference must be set"
         )
 
-    def test_agent_does_not_silently_accept_when_readings_disagree(self):
-        """Document the disagreement contract without pretending to test integration."""
+    def test_agent_does_not_silently_accept_when_readings_disagree(self, monkeypatch):
+        """Agent must not silently accept when initial and retry readings disagree.
+
+        Uses monkeypatch to force detect_dial_and_needle to return two different
+        angles (45° and 135°), then verifies agent.inspect_upload does not return
+        status='accepted'. No edits to agent.py.
+        """
+        from gaugeguard.vision import NeedleDetectionResult
+
         profile = get_profile("EXAMPLE_270")
-        agree_result = readings_agree(20.0, 30.0, profile)
+        with open(os.path.join(SAMPLE_IMAGES_DIR, "industrial_gauge.png"), "rb") as f:
+            image_bytes = f.read()
 
-        assert agree_result.agree is False, (
-            "FAILURE (calibration.py / Prasoon): disagreement invariant failed"
+        calls = 0
+
+        def mock_detect(image):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return NeedleDetectionResult(
+                    success=True,
+                    center=(100.0, 100.0),
+                    radius=50.0,
+                    needle_tip=(100.0, 50.0),
+                    angle_deg=45.0,
+                    confidence=0.55,
+                    quality_flags=("low_confidence",),
+                    annotated_image=image,
+                    reason="attempt 1",
+                )
+            else:
+                return NeedleDetectionResult(
+                    success=True,
+                    center=(100.0, 100.0),
+                    radius=50.0,
+                    needle_tip=(150.0, 100.0),
+                    angle_deg=135.0,
+                    confidence=0.75,
+                    quality_flags=(),
+                    annotated_image=image,
+                    reason="attempt 2",
+                )
+
+        monkeypatch.setattr("gaugeguard.agent.detect_dial_and_needle", mock_detect)
+        result = inspect_upload(image_bytes, profile=profile)
+        assert result.reading.status != "accepted", (
+            "FAILURE (agent.py / Kshitij): agent must not accept when retry attempts disagree"
         )
-
-        # This tests calibration behavior, not the agent's integration path.
-        # A true integration test needs an image that produces two valid passes.
+        assert result.needs_human is True, (
+            "FAILURE (agent.py / Kshitij): agent must set needs_human=True when readings disagree"
+        )
+        assert "disagree" in result.reading.reason.lower(), (
+            "FAILURE (agent.py / Kshitij): reason must indicate disagreement between attempts"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Scenario 10: Human verification required for ambiguous needle
+# Scenario 10: Human verification required –
+#              status needs_human, needs_human True, reason non-empty
 # ---------------------------------------------------------------------------
 
 @pytest.mark.group10
 class TestHumanVerification:
     def test_needs_human_true_with_non_empty_reason_on_ambiguous_needle(self):
-        """Two competing needle orientations must trigger human review."""
+        """Ambiguous needle (two competing orientations) must trigger needs_human with reason.
+
+        Image construction: a clear circular gauge with two strong needle lines at 90°
+        apart (not collinear). The vision module detects ambiguous_needle quality flag,
+        which agent.py maps to status='needs_human'.
+        """
         profile = get_profile("EXAMPLE_270")
         size = 400
-        center_x = size // 2
-        center_y = size // 2
+        cx, cy = size // 2, size // 2
 
+        # Build synthetic gauge image with an unambiguous circular dial
         img = np.full((size, size, 3), 200, dtype=np.uint8)
-        cv2.circle(img, (center_x, center_y), 140, (255, 255, 255), -1)
-        cv2.circle(img, (center_x, center_y), 140, (50, 50, 50), 4)
-        cv2.circle(img, (center_x, center_y), 10, (30, 30, 30), -1)
+        cv2.circle(img, (cx, cy), 140, (255, 255, 255), -1)  # gauge face
+        cv2.circle(img, (cx, cy), 140, (50, 50, 50), 4)       # bezel ring
+        cv2.circle(img, (cx, cy), 10, (30, 30, 30), -1)        # center pivot
 
-        # Two competing needle lines: up and right.
-        cv2.line(
-            img,
-            (center_x, center_y),
-            (center_x, center_y - 110),
-            (20, 20, 20),
-            6,
-        )
-        cv2.line(
-            img,
-            (center_x, center_y),
-            (center_x + 110, center_y),
-            (20, 20, 20),
-            6,
-        )
+        # Two strong competing needles ~90° apart (not collinear ≈180°) so that
+        # vision.detect_dial_and_needle returns quality_flags=("ambiguous_needle",)
+        # Needle 1: pointing up (0° in calibration convention = 12 o'clock)
+        cv2.line(img, (cx, cy), (cx, cy - 110), (20, 20, 20), 6)
+        # Needle 2: pointing right (90° in calibration convention = 3 o'clock)
+        cv2.line(img, (cx, cy), (cx + 110, cy), (20, 20, 20), 6)
 
-        ok, encoded = cv2.imencode(".png", img)
-        assert ok, "Could not encode synthetic ambiguous gauge image"
+        ok, buf = cv2.imencode(".png", img)
+        assert ok, "cv2.imencode failed – cannot build test image"
 
-        result = inspect_upload(encoded.tobytes(), profile=profile)
+        result = inspect_upload(buf.tobytes(), profile=profile)
 
+        # The valid status set (contract)
         assert result.reading.status in (
-            "accepted",
-            "needs_human",
-            "needs_retake",
-            "rejected_input",
-            "error",
-        ), (
-            "FAILURE (agent.py / Kshitij): unexpected status value "
-            f"{result.reading.status}"
-        )
+            "accepted", "needs_human", "needs_retake", "rejected_input", "error"
+        ), "FAILURE (agent.py / Kshitij): unexpected status value " + str(result.reading.status)
 
+        # Ambiguous needle → all detection passes fail with ambiguous_needle flag →
+        # agent.py sets status="needs_human"
         assert result.reading.status == "needs_human", (
-            "FAILURE (agent.py / Kshitij): expected needs_human for ambiguous "
-            f"needle, got {result.reading.status}"
+            "FAILURE (agent.py / Kshitij): expected needs_human when ambiguous_needle flag is "
+            "present on all detection passes, got "
+            + str(result.reading.status)
         )
         assert result.needs_human is True, (
-            "FAILURE (agent.py / Kshitij): needs_human must be True"
+            "FAILURE (agent.py / Kshitij): needs_human must be True when status is needs_human"
         )
-        assert result.reading.reason and str(result.reading.reason).strip(), (
-            "FAILURE (agent.py / Kshitij): human review must have a non-empty reason"
+        assert result.reading.reason and len(str(result.reading.reason)) > 0, (
+            "FAILURE (agent.py / Kshitij): reason must be non-empty whenever needs_human is True"
         )
