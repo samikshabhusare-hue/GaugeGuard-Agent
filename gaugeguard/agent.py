@@ -1,6 +1,9 @@
+
 from __future__ import annotations
 
 from typing import Any
+
+import cv2
 
 from gaugeguard.calibration import (
     AgreementResult,
@@ -21,14 +24,22 @@ from gaugeguard.vision import (
 
 
 def _is_unverified_demo_profile(profile: GaugeProfile | None) -> bool:
-    """Return True if profile is an unverified demonstration profile or uses placeholder units."""
+    """Return True if the profile is a demo profile or uses placeholder units."""
     if profile is None:
         return True
-    if not profile.unit or profile.unit.strip().lower() in ("units", "unit", "placeholder"):
+
+    if not profile.unit or profile.unit.strip().lower() in (
+        "units",
+        "unit",
+        "placeholder",
+    ):
         return True
+
     name_upper = profile.name.upper()
+
     if name_upper.startswith(("EXAMPLE", "DEMO", "SAMPLE", "MOCK", "TEST_")):
         return True
+
     return False
 
 
@@ -36,61 +47,133 @@ def _select_retry_methods(
     quality: ImageQuality,
     initial_detection: NeedleDetectionResult,
 ) -> list[tuple[str, str]]:
-    """Determine evidence-driven alternate preprocessing methods and rationale."""
+    """Choose alternate preprocessing methods based on image evidence."""
     methods: list[tuple[str, str]] = []
 
-    # Evidence: Low contrast or marginal confidence favors CLAHE contrast enhancement
     if (
         "low_contrast" in quality.flags
         or quality.contrast_score < 25.0
-        or (initial_detection.success and initial_detection.confidence < 0.65)
+        or (
+            initial_detection.success
+            and initial_detection.confidence < 0.65
+        )
     ):
-        methods.append((
-            "clahe",
-            f"Image contrast score is {quality.contrast_score:.1f} (or low confidence); "
-            "applying CLAHE local contrast enhancement.",
-        ))
-        methods.append((
-            "adaptive_threshold",
-            "Secondary fallback: applying Gaussian adaptive thresholding to segment dial geometry.",
-        ))
+        methods.append(
+            (
+                "clahe",
+                f"Image contrast score is {quality.contrast_score:.1f} "
+                "(or detection confidence is low); applying CLAHE.",
+            )
+        )
+        methods.append(
+            (
+                "adaptive_threshold",
+                "Secondary fallback: applying Gaussian adaptive thresholding.",
+            )
+        )
     else:
-        # Evidence: Structural detection failure favors adaptive thresholding
         flags_str = (
             ", ".join(initial_detection.quality_flags)
             if initial_detection.quality_flags
             else "unresolved needle"
         )
-        methods.append((
-            "adaptive_threshold",
-            f"Initial pass returned flags [{flags_str}]; "
-            "applying Gaussian adaptive thresholding to isolate needle contours under non-uniform illumination.",
-        ))
-        methods.append((
-            "clahe",
-            "Secondary fallback: applying CLAHE contrast enhancement.",
-        ))
+
+        methods.append(
+            (
+                "adaptive_threshold",
+                f"Initial pass returned flags [{flags_str}]; "
+                "applying adaptive thresholding.",
+            )
+        )
+        methods.append(
+            (
+                "clahe",
+                "Secondary fallback: applying CLAHE contrast enhancement.",
+            )
+        )
 
     return methods
+
+
+def _rejected_image_result(reason: str) -> InspectionResult:
+    """Build a structured rejection result for invalid image uploads."""
+    quality = ImageQuality(
+        width=0,
+        height=0,
+        blur_score=0.0,
+        contrast_score=0.0,
+        flags=("invalid_image",),
+    )
+
+    reading = ReadingEstimate(
+        value=None,
+        unit="",
+        angle_degrees=None,
+        confidence=0.0,
+        status="rejected_input",
+        reason=reason,
+    )
+
+    action_log = [
+        AgentStep(
+            step_name="image_quality",
+            method="opencv_image_validation",
+            reason=reason,
+            output_summary={
+                "decision": "rejected_input",
+                "error": reason,
+            },
+        ),
+        AgentStep(
+            step_name="final_decision",
+            method="input_validation",
+            reason=reason,
+            output_summary={
+                "decision": "rejected_input",
+                "needs_human": False,
+                "value": None,
+            },
+        ),
+    ]
+
+    return InspectionResult(
+        reading=reading,
+        quality=quality,
+        action_log=action_log,
+        annotated_image=None,
+        needs_human=False,
+        attempts=[],
+    )
 
 
 def inspect_upload(
     image_bytes: bytes,
     profile: GaugeProfile | None = None,
 ) -> InspectionResult:
-    """Orchestrate evidence-driven gauge inspection with an agentic retry loop."""
+    """Inspect a gauge image using detection, retries, and quality checks."""
+
     if not image_bytes:
-        raise ValueError("The uploaded image is empty.")
+        return _rejected_image_result("The uploaded image is empty.")
 
     if profile is None:
         profile = get_profile("EXAMPLE_270")
 
-    # Step 1: Pre-flight image quality check
-    quality: ImageQuality = inspect_image_quality(image_bytes)
+    # Step 1: Validate and decode the uploaded image.
+    try:
+        quality: ImageQuality = inspect_image_quality(image_bytes)
+        image = decode_image(image_bytes)
+    except (ValueError, cv2.error) as exc:
+        return _rejected_image_result(
+            f"Invalid or unsupported image: {exc}"
+        )
+
     step1 = AgentStep(
         step_name="image_quality",
         method="opencv_laplacian_and_contrast",
-        reason="Evaluate blur variance, contrast standard deviation, and image resolution.",
+        reason=(
+            "Evaluate blur variance, contrast standard deviation, "
+            "and image resolution."
+        ),
         output_summary={
             "flags": list(quality.flags),
             "blur_score": round(quality.blur_score, 1),
@@ -99,14 +182,13 @@ def inspect_upload(
             "height": quality.height,
         },
     )
+
     action_log = [step1]
     attempts: list[dict[str, Any]] = []
 
-    # Decode image for vision pipeline
-    image = decode_image(image_bytes)
-
-    # Step 2: Initial detection pass (default preprocessing)
+    # Step 2: Initial detection pass.
     initial_detection: NeedleDetectionResult = detect_dial_and_needle(image)
+
     step2 = AgentStep(
         step_name="initial_detection",
         method="detect_dial_and_needle_default",
@@ -123,15 +205,19 @@ def inspect_upload(
             "reason": initial_detection.reason,
         },
     )
+
     action_log.append(step2)
-    attempts.append({
-        "attempt": 1,
-        "method": "default",
-        "success": initial_detection.success,
-        "angle_deg": initial_detection.angle_deg,
-        "confidence": initial_detection.confidence,
-        "flags": list(initial_detection.quality_flags),
-    })
+
+    attempts.append(
+        {
+            "attempt": 1,
+            "method": "default",
+            "success": initial_detection.success,
+            "angle_deg": initial_detection.angle_deg,
+            "confidence": initial_detection.confidence,
+            "flags": list(initial_detection.quality_flags),
+        }
+    )
 
     active_detection = initial_detection
     active_annotated = (
@@ -140,7 +226,7 @@ def inspect_upload(
         else image
     )
 
-    # Evaluate evidence for triggering a retry pass:
+    # Retry when detection fails or the evidence is uncertain.
     needs_retry = (
         not initial_detection.success
         or initial_detection.angle_deg is None
@@ -152,12 +238,42 @@ def inspect_upload(
     retry_detection: NeedleDetectionResult | None = None
 
     if needs_retry:
-        retry_candidates = _select_retry_methods(quality, initial_detection)
+        retry_candidates = _select_retry_methods(
+            quality,
+            initial_detection,
+        )
         attempt_idx = 2
 
         for method_name, method_reason in retry_candidates:
-            preprocessed = preprocess_for_retry(image, method_name)
-            curr_detection = detect_dial_and_needle(preprocessed)
+            try:
+                preprocessed = preprocess_for_retry(image, method_name)
+                curr_detection = detect_dial_and_needle(preprocessed)
+            except (ValueError, cv2.error) as exc:
+                # Log a failed retry rather than crashing the inspection.
+                retry_step = AgentStep(
+                    step_name=f"retry_{method_name}",
+                    method=f"preprocess_for_retry_{method_name}",
+                    reason=f"{method_reason} Retry failed: {exc}",
+                    output_summary={
+                        "attempt": attempt_idx,
+                        "method": method_name,
+                        "success": False,
+                        "reason": str(exc),
+                    },
+                )
+                action_log.append(retry_step)
+                attempts.append(
+                    {
+                        "attempt": attempt_idx,
+                        "method": method_name,
+                        "success": False,
+                        "angle_deg": None,
+                        "confidence": 0.0,
+                        "flags": ["retry_failed"],
+                    }
+                )
+                attempt_idx += 1
+                continue
 
             retry_step = AgentStep(
                 step_name=f"retry_{method_name}",
@@ -175,24 +291,34 @@ def inspect_upload(
                     "reason": curr_detection.reason,
                 },
             )
+
             action_log.append(retry_step)
-            attempts.append({
-                "attempt": attempt_idx,
-                "method": method_name,
-                "success": curr_detection.success,
-                "angle_deg": curr_detection.angle_deg,
-                "confidence": curr_detection.confidence,
-                "flags": list(curr_detection.quality_flags),
-            })
+
+            attempts.append(
+                {
+                    "attempt": attempt_idx,
+                    "method": method_name,
+                    "success": curr_detection.success,
+                    "angle_deg": curr_detection.angle_deg,
+                    "confidence": curr_detection.confidence,
+                    "flags": list(curr_detection.quality_flags),
+                }
+            )
+
             attempt_idx += 1
 
-            if curr_detection.success and curr_detection.angle_deg is not None:
+            if (
+                curr_detection.success
+                and curr_detection.angle_deg is not None
+            ):
                 retry_detection = curr_detection
+
                 if curr_detection.annotated_image is not None:
                     active_annotated = curr_detection.annotated_image
+
                 break
 
-    # Case A: Both initial detection and retry detection succeeded -> compare using readings_agree()
+    # Case A: Both initial and retry detections succeeded.
     if (
         initial_detection.success
         and initial_detection.angle_deg is not None
@@ -200,14 +326,28 @@ def inspect_upload(
         and retry_detection.success
         and retry_detection.angle_deg is not None
     ):
-        cal_init = angle_to_value(initial_detection.angle_deg, profile)
-        cal_retry = angle_to_value(retry_detection.angle_deg, profile)
-        agree_res: AgreementResult = readings_agree(cal_init.value, cal_retry.value, profile)
+        cal_init: CalibrationResult = angle_to_value(
+            initial_detection.angle_deg,
+            profile,
+        )
+        cal_retry: CalibrationResult = angle_to_value(
+            retry_detection.angle_deg,
+            profile,
+        )
+
+        agree_res: AgreementResult = readings_agree(
+            cal_init.value,
+            cal_retry.value,
+            profile,
+        )
 
         cmp_step = AgentStep(
             step_name="reading_comparison",
             method="readings_agree",
-            reason="Compare initial reading and retry reading for consistency within profile tolerance.",
+            reason=(
+                "Compare initial and retry readings for consistency "
+                "within profile tolerance."
+            ),
             output_summary={
                 "initial_value": cal_init.value,
                 "retry_value": cal_retry.value,
@@ -217,30 +357,38 @@ def inspect_upload(
                 "reason": agree_res.reason,
             },
         )
+
         action_log.append(cmp_step)
 
         if not agree_res.agree:
             final_reason = f"Readings disagree: {agree_res.reason}"
+
             reading = ReadingEstimate(
                 value=None,
                 unit=profile.unit,
                 angle_degrees=None,
-                confidence=min(initial_detection.confidence, retry_detection.confidence),
+                confidence=min(
+                    initial_detection.confidence,
+                    retry_detection.confidence,
+                ),
                 status="needs_human",
                 reason=final_reason,
             )
-            dec_step = AgentStep(
-                step_name="final_decision",
-                method="quality_gated_acceptance",
-                reason=final_reason,
-                output_summary={
-                    "decision": "needs_human",
-                    "reason": final_reason,
-                    "needs_human": True,
-                    "value": None,
-                },
+
+            action_log.append(
+                AgentStep(
+                    step_name="final_decision",
+                    method="quality_gated_acceptance",
+                    reason=final_reason,
+                    output_summary={
+                        "decision": "needs_human",
+                        "reason": final_reason,
+                        "needs_human": True,
+                        "value": None,
+                    },
+                )
             )
-            action_log.append(dec_step)
+
             return InspectionResult(
                 reading=reading,
                 quality=quality,
@@ -249,44 +397,71 @@ def inspect_upload(
                 needs_human=True,
                 attempts=attempts,
             )
-        else:
-            # Corroborated! Select pass with higher confidence
-            if retry_detection.confidence >= initial_detection.confidence:
-                active_detection = retry_detection
-                active_cal = cal_retry
-            else:
-                active_detection = initial_detection
-                active_cal = cal_init
 
-    elif retry_detection is not None and retry_detection.success and retry_detection.angle_deg is not None:
+        # The two readings agree. Choose the higher-confidence detection.
+        if retry_detection.confidence >= initial_detection.confidence:
+            active_detection = retry_detection
+            active_cal = cal_retry
+        else:
+            active_detection = initial_detection
+            active_cal = cal_init
+
+    elif (
+        retry_detection is not None
+        and retry_detection.success
+        and retry_detection.angle_deg is not None
+    ):
         active_detection = retry_detection
-        active_cal = angle_to_value(active_detection.angle_deg, profile)
-    elif initial_detection.success and initial_detection.angle_deg is not None:
+        active_cal = angle_to_value(
+            active_detection.angle_deg,
+            profile,
+        )
+
+    elif (
+        initial_detection.success
+        and initial_detection.angle_deg is not None
+    ):
         active_detection = initial_detection
-        active_cal = angle_to_value(active_detection.angle_deg, profile)
+        active_cal = angle_to_value(
+            active_detection.angle_deg,
+            profile,
+        )
+
     else:
-        # All passes failed
-        final_reason = "All vision detection passes failed to localize dial and needle."
+        # Both the initial detection and retries failed.
+        final_reason = (
+            "All vision detection passes failed to localize dial and needle."
+        )
+
+        status = (
+            "needs_human"
+            if "ambiguous_needle" in initial_detection.quality_flags
+            else "needs_retake"
+        )
+
         reading = ReadingEstimate(
             value=None,
             unit=profile.unit,
             angle_degrees=None,
             confidence=0.0,
-            status="needs_human" if "ambiguous_needle" in initial_detection.quality_flags else "needs_retake",
+            status=status,
             reason=final_reason,
         )
-        dec_step = AgentStep(
-            step_name="final_decision",
-            method="quality_gated_acceptance",
-            reason=final_reason,
-            output_summary={
-                "decision": reading.status,
-                "reason": final_reason,
-                "needs_human": True,
-                "value": None,
-            },
+
+        action_log.append(
+            AgentStep(
+                step_name="final_decision",
+                method="quality_gated_acceptance",
+                reason=final_reason,
+                output_summary={
+                    "decision": status,
+                    "reason": final_reason,
+                    "needs_human": True,
+                    "value": None,
+                },
+            )
         )
-        action_log.append(dec_step)
+
         return InspectionResult(
             reading=reading,
             quality=quality,
@@ -296,15 +471,19 @@ def inspect_upload(
             attempts=attempts,
         )
 
-    # Step: Calibration Mapping Record
+    # Record the calibration mapping and any profile warnings.
     cal_flags = list(active_cal.flags)
+
     if _is_unverified_demo_profile(profile):
         cal_flags.append("unverified_demo_profile")
 
     cal_step = AgentStep(
         step_name="calibration_mapping",
         method="linear_angle_to_value",
-        reason=f"Map detected angle {active_detection.angle_deg:.1f}° to engineering value using profile '{profile.name}'.",
+        reason=(
+            f"Map detected angle {active_detection.angle_deg:.1f} degrees "
+            f"using profile '{profile.name}'."
+        ),
         output_summary={
             "value": active_cal.value,
             "unit": active_cal.unit,
@@ -315,20 +494,22 @@ def inspect_upload(
             "reason": active_cal.reason,
         },
     )
+
     action_log.append(cal_step)
 
-    # Determine acceptance vs human verification
     all_flags = (
         list(quality.flags)
         + list(active_detection.quality_flags)
-        + [f for f in cal_flags if f != "linear_scale_assumed"]
+        + [flag for flag in cal_flags if flag != "linear_scale_assumed"]
     )
 
+    # Decide whether the calculated reading can be accepted.
     if active_cal.value is None or not active_cal.in_bounds:
         final_reason = f"Calibration rejected: {active_cal.reason}"
         status = "needs_human"
         value = None
         needs_human = True
+
     elif (
         all_flags
         or "outside_operating_limits" in active_cal.flags
@@ -338,17 +519,21 @@ def inspect_upload(
         status = "needs_human"
         value = active_cal.value
         needs_human = True
+
         flag_desc = ", ".join(all_flags) if all_flags else active_cal.reason
+
         final_reason = (
             f"Reading calculated ({active_cal.value:.2f} {active_cal.unit}), "
             f"but human review required: {flag_desc}"
         )
+
     else:
         status = "accepted"
         value = active_cal.value
         needs_human = False
+
         final_reason = (
-            f"Reading accepted and verified within profile bounds "
+            "Reading accepted and verified within profile bounds "
             f"({active_cal.value:.2f} {active_cal.unit})."
         )
 
@@ -375,6 +560,7 @@ def inspect_upload(
             "flags": all_flags,
         },
     )
+
     action_log.append(dec_step)
 
     return InspectionResult(
@@ -385,5 +571,3 @@ def inspect_upload(
         needs_human=needs_human,
         attempts=attempts,
     )
-
-

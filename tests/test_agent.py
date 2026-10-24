@@ -71,9 +71,11 @@ def _create_synthetic_gauge_bytes(
 
 
 def test_inspect_upload_empty_raises():
-    """Empty byte input must raise ValueError."""
-    with pytest.raises(ValueError):
-        inspect_upload(b"")
+    """Empty byte input must return a structured rejection."""
+    result = inspect_upload(b"")
+
+    assert result.reading.status == "rejected_input"
+    assert result.reading.value is None
 
 
 def test_inspect_upload_synthetic_gauge_accepted():
@@ -253,17 +255,21 @@ def test_inspect_upload_retry_and_comparison_agreement(monkeypatch):
 
 
 def test_inspect_upload_corrupted_bytes_raises():
-    """Non-image bytes (corrupted data) must raise ValueError, not crash."""
+    """Corrupted image bytes must return a structured rejection."""
     garbage = b"\x00\x01\x02\xff" * 100
-    with pytest.raises(ValueError, match="could not be decoded"):
-        inspect_upload(garbage)
+    result = inspect_upload(garbage)
+
+    assert result.reading.status == "rejected_input"
+    assert result.reading.value is None
 
 
 def test_inspect_upload_truncated_jpeg_raises():
-    """Truncated JPEG header must raise ValueError."""
+    """Truncated JPEG data must return a structured rejection."""
     truncated = b"\xff\xd8\xff\xe0\x00\x10JFIF"
-    with pytest.raises(ValueError):
-        inspect_upload(truncated)
+    result = inspect_upload(truncated)
+
+    assert result.reading.status == "rejected_input"
+    assert result.reading.value is None
 
 
 def test_inspect_upload_scale_limit_escalates_human_review():

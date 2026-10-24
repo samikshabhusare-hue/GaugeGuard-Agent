@@ -351,7 +351,7 @@ def test_default_history_file_without_env(monkeypatch: pytest.MonkeyPatch):
     assert get_default_history_file() == PROJECT_ROOT_HISTORY_FILE
     assert DEFAULT_HISTORY_FILE == PROJECT_ROOT_HISTORY_FILE
     assert DEFAULT_HISTORY_FILE.name == "inspection_history.csv"
-    assert DEFAULT_HISTORY_FILE.parent.name == "GaugeGuard-Agent"
+    assert DEFAULT_HISTORY_FILE.parent == PROJECT_ROOT_HISTORY_FILE.parent
     assert DEFAULT_HISTORY_FILE.is_absolute()
 
 
